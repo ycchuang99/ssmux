@@ -106,9 +106,11 @@ impl App {
 struct ConnectionForm {
     edit_name: Option<String>,
     active: usize,
+    action: Option<FormAction>,
     fields: Vec<FormField>,
     document_options: Vec<String>,
     document_index: usize,
+    document_open: bool,
     parameters: Vec<ParameterRow>,
 }
 
@@ -126,6 +128,12 @@ struct TextInput {
     placeholder: &'static str,
     value: String,
     cursor: usize,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum FormAction {
+    Cancel,
+    Save,
 }
 
 const DOCUMENT_FIELD_INDEX: usize = 4;
@@ -213,6 +221,7 @@ impl ConnectionForm {
         Self {
             edit_name: None,
             active: 0,
+            action: None,
             fields: vec![
                 FormField {
                     label: "Name",
@@ -242,6 +251,7 @@ impl ConnectionForm {
                 "AWS-StartPortForwardingSessionToRemoteHost".to_owned(),
             ],
             document_index: 0,
+            document_open: false,
             parameters: vec![ParameterRow::new()],
         }
     }
@@ -357,6 +367,7 @@ impl ConnectionForm {
     }
 
     fn next_field(&mut self) {
+        self.document_open = false;
         if self.active + 1 < self.field_count() {
             self.active += 1;
             return;
@@ -369,11 +380,12 @@ impl ConnectionForm {
             self.parameters.push(ParameterRow::new());
             self.active += 1;
         } else {
-            self.active = 0;
+            self.action = Some(FormAction::Cancel);
         }
     }
 
     fn previous_field(&mut self) {
+        self.document_open = false;
         self.active = if self.active == 0 {
             self.field_count() - 1
         } else {
@@ -492,13 +504,6 @@ async fn run_loop(
                     code: KeyCode::Char('x'),
                     ..
                 } => stop_selected(app),
-                KeyEvent {
-                    code: KeyCode::Char('r'),
-                    ..
-                } => {
-                    app.manager.poll();
-                    app.message = "refreshed".to_owned();
-                }
                 KeyEvent {
                     code: KeyCode::Char('n'),
                     ..
@@ -654,12 +659,23 @@ fn handle_filter_key(app: &mut App, key: KeyEvent) {
 }
 
 fn handle_form_key(app: &mut App, key: KeyEvent) -> Result<()> {
+    if app.form.as_ref().is_some_and(|form| form.action.is_some()) {
+        return handle_form_action_key(app, key);
+    }
+
     match key {
         KeyEvent {
             code: KeyCode::Esc, ..
         } => {
-            app.form = None;
-            app.message = "cancelled".to_owned();
+            let close_document = app.form.as_ref().is_some_and(|form| form.document_open);
+            if close_document {
+                if let Some(form) = app.form.as_mut() {
+                    form.document_open = false;
+                }
+            } else {
+                app.form = None;
+                app.message = "cancelled".to_owned();
+            }
         }
         KeyEvent {
             code: KeyCode::Tab, ..
@@ -681,7 +697,7 @@ fn handle_form_key(app: &mut App, key: KeyEvent) -> Result<()> {
             ..
         } => {
             if let Some(form) = app.form.as_mut() {
-                if form.active == DOCUMENT_FIELD_INDEX {
+                if form.active == DOCUMENT_FIELD_INDEX && form.document_open {
                     form.select_document(1);
                 } else {
                     form.next_field();
@@ -692,7 +708,7 @@ fn handle_form_key(app: &mut App, key: KeyEvent) -> Result<()> {
             code: KeyCode::Up, ..
         } => {
             if let Some(form) = app.form.as_mut() {
-                if form.active == DOCUMENT_FIELD_INDEX {
+                if form.active == DOCUMENT_FIELD_INDEX && form.document_open {
                     form.select_document(-1);
                 } else {
                     form.previous_field();
@@ -703,6 +719,22 @@ fn handle_form_key(app: &mut App, key: KeyEvent) -> Result<()> {
             code: KeyCode::Enter,
             ..
         } => {
+            let document_active = app
+                .form
+                .as_ref()
+                .is_some_and(|form| form.active == DOCUMENT_FIELD_INDEX);
+            if document_active {
+                let document_open = app.form.as_ref().is_some_and(|form| form.document_open);
+                if document_open {
+                    if let Some(form) = app.form.as_mut() {
+                        form.document_open = false;
+                        form.next_field();
+                    }
+                } else if let Some(form) = app.form.as_mut() {
+                    form.document_open = true;
+                }
+                return Ok(());
+            }
             let save = app
                 .form
                 .as_ref()
@@ -736,9 +768,9 @@ fn handle_form_key(app: &mut App, key: KeyEvent) -> Result<()> {
             ..
         } => {
             if let Some(form) = app.form.as_mut() {
-                if form.active == DOCUMENT_FIELD_INDEX {
+                if form.active == DOCUMENT_FIELD_INDEX && form.document_open {
                     form.select_document(-1);
-                } else {
+                } else if form.active != DOCUMENT_FIELD_INDEX {
                     form.active_input_mut().move_left();
                 }
             }
@@ -748,9 +780,9 @@ fn handle_form_key(app: &mut App, key: KeyEvent) -> Result<()> {
             ..
         } => {
             if let Some(form) = app.form.as_mut() {
-                if form.active == DOCUMENT_FIELD_INDEX {
+                if form.active == DOCUMENT_FIELD_INDEX && form.document_open {
                     form.select_document(1);
-                } else {
+                } else if form.active != DOCUMENT_FIELD_INDEX {
                     form.active_input_mut().move_right();
                 }
             }
@@ -780,6 +812,19 @@ fn handle_form_key(app: &mut App, key: KeyEvent) -> Result<()> {
             }
         }
         KeyEvent {
+            code: KeyCode::Char(' '),
+            modifiers,
+            ..
+        } if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+            if let Some(form) = app.form.as_mut() {
+                if form.active == DOCUMENT_FIELD_INDEX {
+                    form.document_open = !form.document_open;
+                } else {
+                    form.active_input_mut().insert(' ');
+                }
+            }
+        }
+        KeyEvent {
             code: KeyCode::Char(character),
             modifiers,
             ..
@@ -792,6 +837,51 @@ fn handle_form_key(app: &mut App, key: KeyEvent) -> Result<()> {
         }
         _ => {}
     }
+    Ok(())
+}
+
+fn handle_form_action_key(app: &mut App, key: KeyEvent) -> Result<()> {
+    let action = app
+        .form
+        .as_ref()
+        .and_then(|form| form.action)
+        .expect("form action exists while handling form action");
+
+    match key.code {
+        KeyCode::Esc => {
+            app.form = None;
+            app.message = "cancelled".to_owned();
+        }
+        KeyCode::Tab | KeyCode::Down | KeyCode::Right => {
+            if let Some(form) = app.form.as_mut() {
+                form.action = Some(match action {
+                    FormAction::Cancel => FormAction::Save,
+                    FormAction::Save => FormAction::Cancel,
+                });
+            }
+        }
+        KeyCode::BackTab | KeyCode::Up | KeyCode::Left => {
+            if let Some(form) = app.form.as_mut() {
+                form.action = match action {
+                    FormAction::Cancel => None,
+                    FormAction::Save => Some(FormAction::Cancel),
+                };
+            }
+        }
+        KeyCode::Enter => match action {
+            FormAction::Cancel => {
+                app.form = None;
+                app.message = "cancelled".to_owned();
+            }
+            FormAction::Save => {
+                if let Err(error) = save_form(app) {
+                    app.message = error.to_string();
+                }
+            }
+        },
+        _ => {}
+    }
+
     Ok(())
 }
 
@@ -905,7 +995,7 @@ fn stop_selected(app: &mut App) {
 
 fn draw(frame: &mut Frame<'_>, app: &App) {
     let show_filter = app.filtering || !app.filter.value.is_empty();
-    let mut constraints = vec![Constraint::Length(3)];
+    let mut constraints = vec![Constraint::Length(5)];
     if show_filter {
         constraints.push(Constraint::Length(3));
     }
@@ -914,12 +1004,24 @@ fn draw(frame: &mut Frame<'_>, app: &App) {
     if show_details {
         constraints.push(Constraint::Length(9));
     }
-    constraints.push(Constraint::Length(3));
+    constraints.push(Constraint::Length(2));
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints(constraints)
         .split(frame.area());
 
+    let header_block = Block::default().borders(Borders::BOTTOM);
+    let header_inner = header_block.inner(chunks[0]);
+    frame.render_widget(header_block, chunks[0]);
+    let header_rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .split(header_inner);
     let title = Paragraph::new(Line::from(vec![
         Span::styled(
             " ssmux ",
@@ -929,9 +1031,38 @@ fn draw(frame: &mut Frame<'_>, app: &App) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw("  AWS SSM session manager"),
-    ]))
-    .block(Block::default().borders(Borders::BOTTOM));
-    frame.render_widget(title, chunks[0]);
+    ]));
+    frame.render_widget(title, header_rows[0]);
+    let shortcut_rows = [
+        [
+            shortcut_line("↑/↓ j/k", "select", Color::Cyan),
+            shortcut_line("n", "new", Color::Green),
+            shortcut_line("e", "edit", Color::Yellow),
+        ],
+        [
+            shortcut_line("d", "delete", Color::Red),
+            shortcut_line("s", "start", Color::Green),
+            shortcut_line("x", "stop", Color::Red),
+        ],
+        [
+            shortcut_line("/", "filter", Color::Cyan),
+            shortcut_line("q", "quit", Color::Magenta),
+            Line::from(""),
+        ],
+    ];
+    for (row_index, row) in shortcut_rows.into_iter().enumerate() {
+        let columns = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(33),
+                Constraint::Percentage(33),
+                Constraint::Percentage(34),
+            ])
+            .split(header_rows[row_index + 1]);
+        for (column_index, line) in row.into_iter().enumerate() {
+            frame.render_widget(Paragraph::new(line), columns[column_index]);
+        }
+    }
 
     let content_index = if show_filter {
         let filter_style = if app.filtering {
@@ -1008,32 +1139,10 @@ fn draw(frame: &mut Frame<'_>, app: &App) {
     } else {
         content_index + 1
     };
-    let footer = Paragraph::new(vec![
-        Line::from(vec![
-            Span::styled("↑/↓ j/k", Style::default().fg(Color::Cyan)),
-            Span::raw(" select  "),
-            Span::styled("n", Style::default().fg(Color::Green)),
-            Span::raw(" new  "),
-            Span::styled("e", Style::default().fg(Color::Yellow)),
-            Span::raw(" edit  "),
-            Span::styled("d", Style::default().fg(Color::Red)),
-            Span::raw(" delete  "),
-            Span::styled("s", Style::default().fg(Color::Green)),
-            Span::raw(" start  "),
-            Span::styled("x", Style::default().fg(Color::Red)),
-            Span::raw(" stop  "),
-            Span::styled("r", Style::default().fg(Color::Yellow)),
-            Span::raw(" refresh  "),
-            Span::styled("/", Style::default().fg(Color::Cyan)),
-            Span::raw(" filter  "),
-            Span::styled("q", Style::default().fg(Color::Magenta)),
-            Span::raw(" quit"),
-        ]),
-        Line::from(Span::styled(
-            app.message.as_str(),
-            Style::default().fg(Color::Gray),
-        )),
-    ])
+    let footer = Paragraph::new(Line::from(Span::styled(
+        app.message.as_str(),
+        Style::default().fg(Color::Gray),
+    )))
     .block(Block::default().borders(Borders::TOP));
     frame.render_widget(footer, chunks[footer_index]);
 
@@ -1043,6 +1152,13 @@ fn draw(frame: &mut Frame<'_>, app: &App) {
     if let Some(name) = &app.delete_confirmation {
         draw_delete_confirmation(frame, name, app.delete_confirmation_selected);
     }
+}
+
+fn shortcut_line(key: &'static str, label: &'static str, color: Color) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(key, Style::default().fg(color)),
+        Span::raw(format!(" {label}")),
+    ])
 }
 
 fn draw_details(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -1157,13 +1273,13 @@ fn draw_form(frame: &mut Frame<'_>, form: &ConnectionForm) {
         .saturating_add(1)
         .saturating_add((form.parameters.len() as u16).saturating_mul(2))
         .saturating_add(2);
-    let dropdown_height = if form.active == DOCUMENT_FIELD_INDEX {
+    let dropdown_height = if form.active == DOCUMENT_FIELD_INDEX && form.document_open {
         form.document_options.len() as u16 + 2
     } else {
         0
     };
     let desired_height = content_height
-        .saturating_add(2)
+        .saturating_add(1)
         .saturating_add(dropdown_height);
     let area = centered_fixed_rect(90, desired_height, frame.area());
     frame.render_widget(Clear, area);
@@ -1184,7 +1300,7 @@ fn draw_form(frame: &mut Frame<'_>, form: &ConnectionForm) {
         Constraint::Length(2),
         form.parameters.len(),
     ));
-    constraints.push(Constraint::Length(2));
+    constraints.push(Constraint::Length(1));
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints(constraints)
@@ -1238,13 +1354,38 @@ fn draw_form(frame: &mut Frame<'_>, form: &ConnectionForm) {
             form.active == form.fields.len() + index * 2 + 1,
         );
     }
+    let cancel_style = if form.action == Some(FormAction::Cancel) {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Red)
+    };
+    let save_style = if form.action == Some(FormAction::Save) {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Green)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Green)
+    };
+    let footer_columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(0), Constraint::Length(22)])
+        .split(rows[footer_index]);
     frame.render_widget(
-        Paragraph::new(
-            "Document: ↑↓ select  |  Parameters: Tab on last Value adds row  Ctrl+D removes row  |  Enter save  Esc cancel",
-        ),
-        rows[footer_index],
+        Paragraph::new("Ctrl+D removes row").style(Style::default().fg(Color::Gray)),
+        footer_columns[0],
     );
-    if form.active == DOCUMENT_FIELD_INDEX {
+    let actions = Paragraph::new(Line::from(vec![
+        Span::styled("[ Cancel ]", cancel_style),
+        Span::raw(" "),
+        Span::styled("[ Save ]", save_style),
+    ]))
+    .alignment(Alignment::Right);
+    frame.render_widget(actions, footer_columns[1]);
+    if form.active == DOCUMENT_FIELD_INDEX && form.document_open {
         draw_document_dropdown(frame, form, rows[DOCUMENT_FIELD_INDEX]);
     }
 }
@@ -1255,11 +1396,12 @@ fn render_document(frame: &mut Frame<'_>, area: Rect, form: &ConnectionForm) {
     } else {
         Style::default().fg(Color::Gray)
     };
+    let indicator = if form.document_open { "▲" } else { "▼" };
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled("Document: ", style),
             Span::styled(
-                format!("[ {} ] ▼", form.document_display()),
+                format!("[ {} ] {indicator}", form.document_display()),
                 style.add_modifier(Modifier::BOLD),
             ),
         ]))
@@ -1349,12 +1491,12 @@ fn input_line(label: &str, input: &TextInput, active: bool) -> Line<'static> {
 }
 
 fn draw_delete_confirmation(frame: &mut Frame<'_>, name: &str, confirm_selected: bool) {
-    let message = format!("確定要刪除 connection '{name}'？");
+    let message = format!("Delete connection '{name}'?");
     let width = display_width(&message).saturating_add(8).clamp(32, 60);
     let area = centered_width_rect(width, 6, frame.area());
     frame.render_widget(Clear, area);
     let block = Block::default()
-        .title(" 確認刪除 ")
+        .title(" Confirm Delete ")
         .borders(Borders::ALL)
         .title_alignment(Alignment::Center)
         .border_style(Style::default().fg(Color::Red));
@@ -1381,9 +1523,9 @@ fn draw_delete_confirmation(frame: &mut Frame<'_>, name: &str, confirm_selected:
             Line::from(message),
             Line::from(""),
             Line::from(vec![
-                Span::styled(" 取消 ", cancel_style),
+                Span::styled(" Cancel ", cancel_style),
                 Span::raw("   "),
-                Span::styled(" 確認 ", confirm_style),
+                Span::styled(" Confirm ", confirm_style),
             ]),
         ])
         .alignment(Alignment::Center),
