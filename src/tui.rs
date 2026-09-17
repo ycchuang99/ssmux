@@ -1002,7 +1002,7 @@ fn draw(frame: &mut Frame<'_>, app: &App) {
     constraints.push(Constraint::Min(4));
     let show_details = !app.visible_statuses().is_empty();
     if show_details {
-        constraints.push(Constraint::Length(9));
+        constraints.push(Constraint::Length(8));
     }
     constraints.push(Constraint::Length(2));
     let chunks = Layout::default()
@@ -1174,22 +1174,14 @@ fn draw_details(frame: &mut Frame<'_>, area: Rect, app: &App) {
     else {
         return;
     };
-    let parameters = if connection.parameters.is_empty() {
-        "-".to_owned()
-    } else {
-        connection
-            .parameters
-            .iter()
-            .map(|(key, value)| format!("{key}={value}"))
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
     let label_style = Style::default()
         .fg(Color::Cyan)
         .add_modifier(Modifier::BOLD);
+    let parameter_key_style = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
     let detail = Paragraph::new(vec![
         detail_line("NAME", connection.name.as_str(), label_style),
-        detail_line("STATE", format_state(status.state), label_style),
         detail_line("TARGET", connection.target.as_str(), label_style),
         detail_line(
             "REGION",
@@ -1206,7 +1198,7 @@ fn draw_details(frame: &mut Frame<'_>, area: Rect, app: &App) {
             connection.document_name.as_deref().unwrap_or("-"),
             label_style,
         ),
-        detail_line("PARAMETERS", parameters.as_str(), label_style),
+        parameters_detail_line(&connection.parameters, label_style, parameter_key_style),
     ])
     .block(Block::default().title(" Details ").borders(Borders::ALL));
     frame.render_widget(detail, area);
@@ -1217,6 +1209,27 @@ fn detail_line(label: &str, value: &str, label_style: Style) -> Line<'static> {
         Span::styled(format!("{label}: "), label_style),
         Span::raw(value.to_owned()),
     ])
+}
+
+fn parameters_detail_line(
+    parameters: &std::collections::BTreeMap<String, String>,
+    label_style: Style,
+    key_style: Style,
+) -> Line<'static> {
+    let mut spans = vec![Span::styled("PARAMETERS: ", label_style)];
+    if parameters.is_empty() {
+        spans.push(Span::raw("-"));
+    } else {
+        for (index, (key, value)) in parameters.iter().enumerate() {
+            if index > 0 {
+                spans.push(Span::raw(", "));
+            }
+            spans.push(Span::styled(key.clone(), key_style));
+            spans.push(Span::raw("="));
+            spans.push(Span::raw(value.clone()));
+        }
+    }
+    Line::from(spans)
 }
 
 fn table_widths(available_width: u16, statuses: &[crate::session::ConnectionStatus]) -> [u16; 6] {
@@ -1265,7 +1278,8 @@ fn display_width(value: &str) -> u16 {
 }
 
 fn draw_form(frame: &mut Frame<'_>, form: &ConnectionForm) {
-    let parameter_header_index = form.fields.len();
+    let hint_index = 0;
+    let parameter_header_index = form.fields.len() + 1;
     let parameter_start_index = parameter_header_index + 1;
     let footer_index = parameter_start_index + form.parameters.len();
     let content_height = (form.fields.len() as u16)
@@ -1281,7 +1295,7 @@ fn draw_form(frame: &mut Frame<'_>, form: &ConnectionForm) {
     let desired_height = content_height
         .saturating_add(1)
         .saturating_add(dropdown_height);
-    let area = centered_fixed_rect(90, desired_height, frame.area());
+    let area = centered_fixed_rect(80, desired_height.saturating_add(2), frame.area());
     frame.render_widget(Clear, area);
     let block = Block::default()
         .title(if form.edit_name.is_some() {
@@ -1293,8 +1307,18 @@ fn draw_form(frame: &mut Frame<'_>, form: &ConnectionForm) {
         .border_style(Style::default().fg(Color::Cyan));
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    let content = Rect {
+        x: inner.x.saturating_add(1),
+        y: inner.y,
+        width: inner.width.saturating_sub(2),
+        height: inner.height,
+    };
 
-    let mut constraints = vec![Constraint::Length(2); form.fields.len()];
+    let mut constraints = vec![Constraint::Length(2)];
+    constraints.extend(std::iter::repeat_n(
+        Constraint::Length(2),
+        form.fields.len(),
+    ));
     constraints.push(Constraint::Length(1));
     constraints.extend(std::iter::repeat_n(
         Constraint::Length(2),
@@ -1304,20 +1328,30 @@ fn draw_form(frame: &mut Frame<'_>, form: &ConnectionForm) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints(constraints)
-        .split(inner);
+        .split(content);
     for (index, field) in form.fields.iter().enumerate() {
+        let row_index = index + 1;
         if index == DOCUMENT_FIELD_INDEX {
-            render_document(frame, rows[index], form);
+            render_document(frame, rows[row_index], form);
         } else {
             render_input(
                 frame,
-                rows[index],
+                rows[row_index],
                 field.label,
                 &field.input,
                 form.active == index,
             );
         }
     }
+    let hint = Paragraph::new("Ctrl+D removes row")
+        .style(Style::default().fg(Color::Gray))
+        .alignment(Alignment::Center)
+        .block(
+            Block::default()
+                .borders(Borders::BOTTOM)
+                .border_style(Style::default().fg(Color::DarkGray)),
+        );
+    frame.render_widget(hint, rows[hint_index]);
     let parameter_header = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
@@ -1370,23 +1404,15 @@ fn draw_form(frame: &mut Frame<'_>, form: &ConnectionForm) {
     } else {
         Style::default().fg(Color::Green)
     };
-    let footer_columns = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(0), Constraint::Length(22)])
-        .split(rows[footer_index]);
-    frame.render_widget(
-        Paragraph::new("Ctrl+D removes row").style(Style::default().fg(Color::Gray)),
-        footer_columns[0],
-    );
     let actions = Paragraph::new(Line::from(vec![
         Span::styled("[ Cancel ]", cancel_style),
         Span::raw(" "),
         Span::styled("[ Save ]", save_style),
     ]))
-    .alignment(Alignment::Right);
-    frame.render_widget(actions, footer_columns[1]);
+    .alignment(Alignment::Center);
+    frame.render_widget(actions, rows[footer_index]);
     if form.active == DOCUMENT_FIELD_INDEX && form.document_open {
-        draw_document_dropdown(frame, form, rows[DOCUMENT_FIELD_INDEX]);
+        draw_document_dropdown(frame, form, rows[DOCUMENT_FIELD_INDEX + 1]);
     }
 }
 
