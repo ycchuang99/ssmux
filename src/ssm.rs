@@ -6,6 +6,33 @@ use tokio::process::{Child, Command};
 use crate::config::ConnectionConfig;
 
 pub fn spawn_session(config: &ConnectionConfig) -> Result<Child> {
+    let mut command = command_for(config);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(Into::into)
+}
+
+pub fn spawn_interactive_session(config: &ConnectionConfig) -> Result<Child> {
+    let mut command = command_for(config);
+    command
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(Into::into)
+}
+
+pub fn is_interactive(config: &ConnectionConfig) -> bool {
+    matches!(
+        config.document_name.as_deref(),
+        None | Some("AWS-StartInteractiveCommand")
+    )
+}
+
+fn command_for(config: &ConnectionConfig) -> Command {
     let mut command = Command::new("aws");
     if let Some(profile) = &config.profile {
         command.arg("--profile").arg(profile);
@@ -27,12 +54,6 @@ pub fn spawn_session(config: &ConnectionConfig) -> Result<Child> {
     }
     command.args(&config.extra_args);
     command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(Into::into)
 }
 
 fn parameters_argument(parameters: &BTreeMap<String, String>) -> Option<String> {
@@ -68,7 +89,6 @@ mod tests {
                 ("portNumber".to_owned(), "22".to_owned()),
             ]),
             extra_args: Vec::new(),
-            keep_on_exit: false,
         };
 
         assert_eq!(

@@ -1,7 +1,7 @@
 use std::{collections::BTreeMap, path::Path, path::PathBuf};
 
 use anyhow::{Context, Result};
-use directories::ProjectDirs;
+use directories::BaseDirs;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -24,8 +24,6 @@ pub struct ConnectionConfig {
     pub parameters: BTreeMap<String, String>,
     #[serde(default)]
     pub extra_args: Vec<String>,
-    #[serde(default)]
-    pub keep_on_exit: bool,
 }
 
 impl Config {
@@ -90,42 +88,33 @@ impl Config {
 }
 
 pub fn default_config_path() -> PathBuf {
-    project_dirs()
-        .map(|dirs| dirs.config_dir().join("config.toml"))
+    BaseDirs::new()
+        .map(|dirs| dirs.home_dir().join(".ssmux").join("config.toml"))
         .unwrap_or_else(|| PathBuf::from("config.toml"))
-}
-
-pub fn default_socket_path() -> PathBuf {
-    project_dirs()
-        .map(|dirs| dirs.data_local_dir().join("ssmux.sock"))
-        .unwrap_or_else(|| PathBuf::from("ssmux.sock"))
-}
-
-fn project_dirs() -> Option<ProjectDirs> {
-    ProjectDirs::from("", "", "ssmux")
 }
 
 pub fn example_config() -> &'static str {
     r#"# ssmux connection configuration
-# Run `ssmux daemon` in another terminal after editing this file.
-
-[[connections]]
-name = "demo-stage"
-target = "i-0deadbeefdeadbeef0"
-region = "us-west-2"
-# profile = "example-profile"
-document_name = "AWS-StartPortForwardingSession"
-keep_on_exit = true
-
-[connections.parameters]
-portNumber = "22"
-localPortNumber = "10022"
-
-# For remote-host forwarding, use this document and add a host parameter:
-# document_name = "AWS-StartPortForwardingSessionToRemoteHost"
-# [connections.parameters]
-# host = "db.example.test"
-# portNumber = "5432"
-# localPortNumber = "15432"
+# Run `ssmux` after editing this file to open the TUI.
+# Add connections from the TUI with `n`, or use `ssmux config add`.
 "#
+}
+
+pub fn parse_parameters(values: &[String]) -> Result<BTreeMap<String, String>> {
+    let mut parameters = BTreeMap::new();
+    for value in values {
+        let (key, parameter) = value
+            .split_once('=')
+            .with_context(|| format!("parameter must use KEY=VALUE: {value}"))?;
+        if key.trim().is_empty() || parameter.trim().is_empty() {
+            anyhow::bail!("parameter must have a non-empty key and value: {value}");
+        }
+        if parameters
+            .insert(key.to_owned(), parameter.to_owned())
+            .is_some()
+        {
+            anyhow::bail!("duplicate parameter: {key}");
+        }
+    }
+    Ok(parameters)
 }
