@@ -11,14 +11,39 @@ This repository contains the first MVP:
 - Configuration CRUD through `ssmux config`
 - AWS CLI `ssm start-session` child-process lifecycle management
 - `start`, `status`, `doctor`, `init`, and `config` commands
-- TUI keyboard controls for selecting, starting, stopping, and refreshing sessions
+- TUI keyboard controls for selecting, starting, and stopping sessions
+
+## Installation
+
+### Homebrew
+
+The Homebrew formula is maintained in the `ycchuang99/homebrew-ssmux` tap. After the formula is published:
+
+```bash
+brew install ycchuang99/ssmux/ssmux
+```
+
+`ssmux` also requires the AWS CLI and Session Manager Plugin:
+
+```bash
+brew install awscli
+brew install --cask session-manager-plugin
+```
+
+### Build from source
+
+```bash
+cargo build --release
+sudo install -m 0755 target/release/ssmux /usr/local/bin/ssmux
+```
 
 ## Requirements
 
-- Rust toolchain
 - AWS CLI v2
 - Session Manager Plugin
 - An AWS profile with permission to start the configured SSM session
+
+Rust is only required when building `ssmux` from source.
 
 ## Quick start
 
@@ -68,7 +93,7 @@ ssmux config add demo-db --target i-0deadbeefdeadbeef0 \
   --region us-west-2 --document-name AWS-StartPortForwardingSessionToRemoteHost \
   --parameter host=db.example.test --parameter portNumber=5432 \
   --parameter localPortNumber=15432
-ssmux config edit demo-db --temporary
+ssmux config edit demo-db --region us-east-1
 ssmux config remove demo-db
 ```
 
@@ -82,7 +107,6 @@ Configuration changes are loaded the next time the TUI or `start` command is lau
 - `d`: ask for confirmation, then delete the selected connection
 - `s`: start the selected connection
 - `x`: stop the selected connection
-- `r`: refresh state
 - `/`: open the connection filter; press `Enter` or `Esc` to close it
 - `q`, `Esc`, or `Ctrl-C`: quit the TUI
 
