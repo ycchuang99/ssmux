@@ -335,7 +335,9 @@ fn build_connection(connection: &ConnectionConfig) -> Result<ConnectionMenu> {
 
 fn green_pixels(pixels: &[u8]) -> Vec<u8> {
     pixels
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .flat_map(|pixel| [46, 204, 113, pixel[3]])
         .collect()
 }
