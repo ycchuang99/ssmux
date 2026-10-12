@@ -12,6 +12,7 @@ This repository contains the first MVP:
 - AWS CLI `ssm start-session` child-process lifecycle management
 - `start`, `status`, `doctor`, `init`, and `config` commands
 - TUI keyboard controls for selecting, starting, and stopping sessions
+- A macOS menu bar mode in the same executable
 
 ## Installation
 
@@ -61,7 +62,7 @@ In another terminal:
 ./target/release/ssmux start demo-stage
 ```
 
-`ssmux start NAME` runs one session in the foreground; press `Ctrl-C` to stop it. `ssmux status` lists configured connections, while live state is shown by the TUI.
+`ssmux start NAME` runs one session in the foreground; press `Ctrl-C` to stop it. `ssmux status` lists configured connections, while live state is shown by a running TUI or menu bar process.
 
 The default configuration path is `~/.ssmux/config.toml`. Override it with `--config PATH`.
 
@@ -97,11 +98,18 @@ ssmux config edit demo-db --region us-east-1
 ssmux config remove demo-db
 ```
 
-Configuration changes are loaded the next time the TUI or `start` command is launched.
+Configuration changes are loaded when the TUI, menu bar, or `start` command is launched.
+
+## macOS menu bar
+
+The menu bar uses a monochrome terminal-and-channels icon that adapts to macOS appearance. The icon turns green while sessions are active; no number is displayed. Connected sessions use green status dots in the list. Each connection shows its state, target, AWS region/profile, forwarding endpoint, and last error in its submenu. Choose **New Session…** to open a native form and save a connection; it appears in the list immediately and remains disconnected until you choose **Start Session**. The app bundle includes the matching blue/teal icon. Regenerate the vector-drawn assets on macOS with `swift scripts/generate-icons.swift`.
+
+Run `./scripts/run-macos-menubar.sh` from the source checkout to build and open the menu bar-only bundle using the same `ssmux` executable. Click `ssmux` in the menu bar, choose a connection, then start or stop its background session. Quitting the menu bar process stops sessions it owns. Interactive shell sessions must be started from the TUI.
 
 ## TUI controls
 
 - `↑` / `↓` or `j` / `k`: select a connection
+- Click a header action; session actions apply to the selected connection
 - `n`: add a connection
 - `e`: edit the selected connection
 - `d`: ask for confirmation, then delete the selected connection

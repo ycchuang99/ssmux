@@ -1,5 +1,9 @@
 mod cli;
 mod config;
+#[cfg(target_os = "macos")]
+mod menubar;
+#[cfg(target_os = "macos")]
+mod menubar_form;
 mod session;
 mod ssm;
 mod tui;
@@ -24,11 +28,18 @@ async fn main() {
 }
 
 async fn run() -> Result<()> {
+    #[cfg(target_os = "macos")]
+    if std::env::var_os("SSMUX_MENUBAR").is_some() {
+        return menubar::run(&config::default_config_path()).await;
+    }
+
     let cli = Cli::parse();
     let config_path = cli.config.unwrap_or_else(config::default_config_path);
 
     match cli.command.unwrap_or(Command::Tui) {
         Command::Tui => tui::run(&config_path).await,
+        #[cfg(target_os = "macos")]
+        Command::Menubar => menubar::run(&config_path).await,
         Command::Start { name } => run_foreground(&config_path, &name).await,
         Command::Status { json } => {
             let config = Config::load_or_default(&config_path)?;

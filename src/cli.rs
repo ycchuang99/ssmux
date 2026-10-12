@@ -23,9 +23,12 @@ pub struct Cli {
 pub enum Command {
     /// Open the terminal user interface.
     Tui,
+    #[cfg(target_os = "macos")]
+    /// Run a menu bar-only session controller on macOS.
+    Menubar,
     /// Run one configured session in the foreground; Ctrl-C stops it.
     Start { name: String },
-    /// List configured connections. Live state belongs to the current TUI.
+    /// List configured connections. Live state belongs to the current TUI or menu bar process.
     Status {
         /// Print machine-readable JSON.
         #[arg(long)]

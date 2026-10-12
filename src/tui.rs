@@ -5,7 +5,10 @@ use std::{
 
 use anyhow::{Context, Result};
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
+        MouseButton, MouseEventKind,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -137,6 +140,88 @@ enum FormAction {
 }
 
 const DOCUMENT_FIELD_INDEX: usize = 4;
+
+#[derive(Clone, Copy)]
+enum HeaderAction {
+    New,
+    Edit,
+    Delete,
+    Start,
+    Stop,
+    Filter,
+    Quit,
+}
+
+#[derive(Clone, Copy)]
+struct HeaderControl {
+    action: Option<HeaderAction>,
+    key: &'static str,
+    label: &'static str,
+    color: Color,
+}
+
+const HEADER_CONTROLS: [[HeaderControl; 3]; 3] = [
+    [
+        HeaderControl {
+            action: None,
+            key: "↑/↓ j/k",
+            label: "select",
+            color: Color::Cyan,
+        },
+        HeaderControl {
+            action: Some(HeaderAction::New),
+            key: "n",
+            label: "new",
+            color: Color::Green,
+        },
+        HeaderControl {
+            action: Some(HeaderAction::Edit),
+            key: "e",
+            label: "edit",
+            color: Color::Yellow,
+        },
+    ],
+    [
+        HeaderControl {
+            action: Some(HeaderAction::Delete),
+            key: "d",
+            label: "delete",
+            color: Color::Red,
+        },
+        HeaderControl {
+            action: Some(HeaderAction::Start),
+            key: "s",
+            label: "start",
+            color: Color::Green,
+        },
+        HeaderControl {
+            action: Some(HeaderAction::Stop),
+            key: "x",
+            label: "stop",
+            color: Color::Red,
+        },
+    ],
+    [
+        HeaderControl {
+            action: Some(HeaderAction::Filter),
+            key: "/",
+            label: "filter",
+            color: Color::Cyan,
+        },
+        HeaderControl {
+            action: Some(HeaderAction::Quit),
+            key: "q",
+            label: "quit",
+            color: Color::Magenta,
+        },
+        HeaderControl {
+            action: None,
+            key: "",
+            label: "",
+            color: Color::Gray,
+        },
+    ],
+];
 
 impl TextInput {
     fn new(placeholder: &'static str) -> Self {
@@ -432,14 +517,18 @@ pub async fn run(config_path: &Path) -> Result<()> {
 
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     let result = run_loop(&mut terminal, &mut app).await;
     app.manager.shutdown().await;
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
     terminal.show_cursor()?;
     result
 }
@@ -453,8 +542,27 @@ async fn run_loop(
         terminal.draw(|frame| draw(frame, app))?;
 
         if event::poll(Duration::from_millis(100))? {
-            let Event::Key(key) = event::read()? else {
-                continue;
+            let key = match event::read()? {
+                Event::Mouse(mouse)
+                    if mouse.kind == MouseEventKind::Down(MouseButton::Left)
+                        && app.form.is_none()
+                        && app.delete_confirmation.is_none()
+                        && !app.filtering =>
+                {
+                    let terminal_area = terminal.size()?;
+                    let header_area =
+                        Rect::new(0, 0, terminal_area.width, terminal_area.height.min(5));
+                    let Some(action) = header_action_at(header_area, mouse.column, mouse.row)
+                    else {
+                        continue;
+                    };
+                    if handle_header_action(terminal, app, action).await {
+                        break;
+                    }
+                    continue;
+                }
+                Event::Key(key) => key,
+                _ => continue,
             };
             if app.form.is_some() {
                 handle_form_key(app, key)?;
@@ -993,6 +1101,35 @@ fn stop_selected(app: &mut App) {
     };
 }
 
+fn header_action_at(area: Rect, x: u16, y: u16) -> Option<HeaderAction> {
+    let row = y.checked_sub(area.y + 1)? as usize;
+    if row >= HEADER_CONTROLS.len() || x < area.x || x >= area.x + area.width || area.width == 0 {
+        return None;
+    }
+    let column = (u32::from(x - area.x) * 3 / u32::from(area.width)) as usize;
+    HEADER_CONTROLS[row][column.min(2)].action
+}
+
+async fn handle_header_action(
+    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    app: &mut App,
+    action: HeaderAction,
+) -> bool {
+    match action {
+        HeaderAction::New => app.form = Some(ConnectionForm::new()),
+        HeaderAction::Edit => begin_edit(app),
+        HeaderAction::Delete => delete_selected(app),
+        HeaderAction::Start => start_selected(terminal, app).await,
+        HeaderAction::Stop => stop_selected(app),
+        HeaderAction::Filter => {
+            app.filtering = true;
+            app.filter.move_end();
+        }
+        HeaderAction::Quit => return true,
+    }
+    false
+}
+
 fn draw(frame: &mut Frame<'_>, app: &App) {
     let show_filter = app.filtering || !app.filter.value.is_empty();
     let mut constraints = vec![Constraint::Length(5)];
@@ -1033,24 +1170,7 @@ fn draw(frame: &mut Frame<'_>, app: &App) {
         Span::raw("  AWS SSM session manager"),
     ]));
     frame.render_widget(title, header_rows[0]);
-    let shortcut_rows = [
-        [
-            shortcut_line("↑/↓ j/k", "select", Color::Cyan),
-            shortcut_line("n", "new", Color::Green),
-            shortcut_line("e", "edit", Color::Yellow),
-        ],
-        [
-            shortcut_line("d", "delete", Color::Red),
-            shortcut_line("s", "start", Color::Green),
-            shortcut_line("x", "stop", Color::Red),
-        ],
-        [
-            shortcut_line("/", "filter", Color::Cyan),
-            shortcut_line("q", "quit", Color::Magenta),
-            Line::from(""),
-        ],
-    ];
-    for (row_index, row) in shortcut_rows.into_iter().enumerate() {
+    for (row_index, row) in HEADER_CONTROLS.iter().enumerate() {
         let columns = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
@@ -1059,7 +1179,12 @@ fn draw(frame: &mut Frame<'_>, app: &App) {
                 Constraint::Percentage(34),
             ])
             .split(header_rows[row_index + 1]);
-        for (column_index, line) in row.into_iter().enumerate() {
+        for (column_index, control) in row.iter().enumerate() {
+            let line = if control.label.is_empty() {
+                Line::from("")
+            } else {
+                shortcut_line(control.key, control.label, control.color)
+            };
             frame.render_widget(Paragraph::new(line), columns[column_index]);
         }
     }
