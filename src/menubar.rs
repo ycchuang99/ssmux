@@ -13,7 +13,7 @@ use tao::{
     },
 };
 use tray_icon::{
-    menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu},
+    menu::{IconMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem},
     Icon, TrayIcon, TrayIconBuilder,
 };
 
@@ -32,27 +32,26 @@ enum SessionAction {
 
 struct ConnectionMenu {
     name: String,
-    submenu: Submenu,
-    detail: MenuItem,
-    start: Option<MenuItem>,
-    stop: Option<MenuItem>,
+    item: IconMenuItem,
+    state: ConnectionState,
+    interactive: bool,
 }
 
 pub async fn run(config_path: &Path) -> Result<()> {
     let mut config = Config::load_or_default(config_path)?;
     let mut manager = SessionManager::new(config.clone());
     let menu = Menu::new();
-    menu.append(&MenuItem::new("SSMux", false, None))?;
+    menu.append(&MenuItem::new("ssmux", false, None))?;
     let summary = MenuItem::new("No active sessions", false, None);
     menu.append(&summary)?;
-    let message = MenuItem::new("Select a connection to start", false, None);
+    let message = MenuItem::new("Click ▶ to start · ■ to stop", false, None);
     menu.append(&message)?;
     menu.append(&PredefinedMenuItem::separator())?;
 
     let mut connections = Vec::new();
     for connection in &config.connections {
         let item = build_connection(connection)?;
-        menu.append(&item.submenu)?;
+        menu.append(&item.item)?;
         connections.push(item);
     }
     let mut empty_item = if connections.is_empty() {
@@ -65,7 +64,7 @@ pub async fn run(config_path: &Path) -> Result<()> {
     menu.append(&PredefinedMenuItem::separator())?;
     let add = MenuItem::new("New Session…", true, None);
     menu.append(&add)?;
-    let quit = MenuItem::new("Quit SSMux & Stop Sessions", true, None);
+    let quit = MenuItem::new("Quit ssmux & Stop Sessions", true, None);
     menu.append(&quit)?;
 
     let idle_pixels = include_bytes!("../assets/menu-template.rgba");
@@ -92,7 +91,7 @@ pub async fn run(config_path: &Path) -> Result<()> {
                     .with_menu(Box::new(menu.clone()))
                     .with_icon(icons[0].clone())
                     .with_icon_as_template(true)
-                    .with_tooltip("SSMux · AWS SSM session manager")
+                    .with_tooltip("ssmux")
                     .build()
                 {
                     Ok(item) => tray = Some(item),
@@ -114,7 +113,7 @@ pub async fn run(config_path: &Path) -> Result<()> {
                     if let Some(empty) = empty_item.take() {
                         menu.remove(&empty)?;
                     }
-                    menu.insert(&item.submenu, 4 + connections.len())?;
+                    menu.insert(&item.item, 4 + connections.len())?;
                     connections.push(item);
                     last_counts = None;
                     Ok(Some(name))
@@ -128,43 +127,46 @@ pub async fn run(config_path: &Path) -> Result<()> {
                 }
             }
             Event::UserEvent(event) => {
-                if let Some(connection) = connections.iter().find(|connection| {
-                    connection
-                        .start
-                        .as_ref()
-                        .is_some_and(|item| *item.id() == event.id)
-                        || connection
-                            .stop
-                            .as_ref()
-                            .is_some_and(|item| *item.id() == event.id)
-                }) {
-                    let name = &connection.name;
-                    let action = if connection
-                        .start
-                        .as_ref()
-                        .is_some_and(|item| *item.id() == event.id)
-                    {
-                        SessionAction::Start
+                if let Some(connection) = connections
+                    .iter()
+                    .find(|connection| *connection.item.id() == event.id)
+                {
+                    let name = connection.name.clone();
+                    let state = manager
+                        .statuses()
+                        .into_iter()
+                        .find(|status| status.name == name)
+                        .map(|status| status.state);
+                    let action = if connection.interactive {
+                        None
                     } else {
-                        SessionAction::Stop
+                        match state {
+                            Some(ConnectionState::Running) => Some(SessionAction::Stop),
+                            Some(ConnectionState::Stopped | ConnectionState::Failed) => {
+                                Some(SessionAction::Start)
+                            }
+                            Some(ConnectionState::Stopping) | None => None,
+                        }
                     };
-                    let result = match action {
-                        SessionAction::Start => manager.start(name),
-                        SessionAction::Stop => manager.stop(name),
-                    };
-                    set_text(
-                        &message,
-                        match result {
-                            Ok(()) => format!(
-                                "{} {name}",
-                                match action {
-                                    SessionAction::Start => "Started",
-                                    SessionAction::Stop => "Stopping",
-                                }
-                            ),
-                            Err(error) => format!("{name}: {error}"),
-                        },
-                    );
+                    if let Some(action) = action {
+                        let result = match action {
+                            SessionAction::Start => manager.start(&name),
+                            SessionAction::Stop => manager.stop(&name),
+                        };
+                        set_text(
+                            &message,
+                            match result {
+                                Ok(()) => format!(
+                                    "{} {name}",
+                                    match action {
+                                        SessionAction::Start => "Started",
+                                        SessionAction::Stop => "Stopping",
+                                    }
+                                ),
+                                Err(error) => format!("{name}: {error}"),
+                            },
+                        );
+                    }
                 }
             }
             Event::MainEventsCleared => {
@@ -172,8 +174,9 @@ pub async fn run(config_path: &Path) -> Result<()> {
                 if let Some(tray) = &tray {
                     if let Err(error) = update_menu(
                         &manager,
-                        &connections,
+                        &mut connections,
                         &summary,
+                        &message,
                         tray,
                         &icons,
                         &mut last_counts,
@@ -201,8 +204,9 @@ fn set_text(item: &MenuItem, text: String) {
 
 fn update_menu(
     manager: &SessionManager,
-    connections: &[ConnectionMenu],
+    connections: &mut [ConnectionMenu],
     summary: &MenuItem,
+    message: &MenuItem,
     tray: &TrayIcon,
     icons: &[Icon; 2],
     last_counts: &mut Option<(usize, usize)>,
@@ -226,47 +230,33 @@ fn update_menu(
             "{active} active · {failed} failed · {} configured",
             statuses.len()
         );
-        set_text(summary, text.clone());
+        set_text(summary, text);
         tray.set_icon_with_as_template(Some(icons[usize::from(active > 0)].clone()), active == 0)?;
-        let _ = tray.set_tooltip(Some(format!("SSMux · {text}")));
         *last_counts = Some((active, failed));
     }
     for connection in connections {
         let Some(status) = statuses.iter().find(|s| s.name == connection.name) else {
             continue;
         };
-        let (color, state) = match status.state {
-            ConnectionState::Running => ([46, 204, 113], "Connected"),
-            ConnectionState::Stopping => ([235, 170, 45], "Stopping"),
-            ConnectionState::Stopped => ([145, 145, 150], "Disconnected"),
-            ConnectionState::Failed => ([230, 75, 75], "Failed"),
-        };
-        let title = format!("{} — {state}", connection.name);
-        if connection.submenu.text() != title {
-            connection.submenu.set_text(title);
-            connection.submenu.set_icon(Some(status_dot(color)?));
-        }
-        let detail = status
-            .last_error
-            .clone()
-            .unwrap_or_else(|| match status.state {
-                ConnectionState::Running => "Session is active".to_owned(),
-                ConnectionState::Stopping => "Waiting for the session to exit…".to_owned(),
-                _ => "Ready to connect".to_owned(),
-            });
-        set_text(&connection.detail, detail);
-        if let (Some(start), Some(stop)) = (&connection.start, &connection.stop) {
-            let can_start = matches!(
+        if connection.state != status.state {
+            connection.item.set_text(connection_text(
+                &connection.name,
                 status.state,
-                ConnectionState::Stopped | ConnectionState::Failed
-            );
-            let can_stop = status.state == ConnectionState::Running;
-            if start.is_enabled() != can_start {
-                start.set_enabled(can_start);
+                connection.interactive,
+            ));
+            connection
+                .item
+                .set_icon(Some(status_dot(status_color(status.state))?));
+            if status.state == ConnectionState::Failed {
+                if let Some(error) = &status.last_error {
+                    set_text(message, format!("{}: {error}", connection.name));
+                }
             }
-            if stop.is_enabled() != can_stop {
-                stop.set_enabled(can_stop);
-            }
+            connection.state = status.state;
+        }
+        let can_run = !connection.interactive && status.state != ConnectionState::Stopping;
+        if connection.item.is_enabled() != can_run {
+            connection.item.set_enabled(can_run);
         }
     }
     Ok(())
@@ -274,63 +264,40 @@ fn update_menu(
 
 fn build_connection(connection: &ConnectionConfig) -> Result<ConnectionMenu> {
     let interactive = ssm::is_interactive(connection);
-    let submenu = Submenu::new(&connection.name, true);
-    submenu.append(&MenuItem::new(
-        format!("Target: {}", connection.target),
-        false,
+    let state = ConnectionState::Stopped;
+    let item = IconMenuItem::new(
+        connection_text(&connection.name, state, interactive),
+        !interactive,
+        Some(status_dot(status_color(state))?),
         None,
-    ))?;
-    submenu.append(&MenuItem::new(
-        format!(
-            "Region: {}   ·   Profile: {}",
-            connection.region.as_deref().unwrap_or("AWS default"),
-            connection.profile.as_deref().unwrap_or("AWS default")
-        ),
-        false,
-        None,
-    ))?;
-    if let Some(port) = connection.parameters.get("localPortNumber") {
-        let host = connection
-            .parameters
-            .get("host")
-            .map(String::as_str)
-            .unwrap_or(&connection.target);
-        let remote_port = connection
-            .parameters
-            .get("portNumber")
-            .map(String::as_str)
-            .unwrap_or("—");
-        submenu.append(&MenuItem::new(
-            format!("localhost:{port} → {host}:{remote_port}"),
-            false,
-            None,
-        ))?;
-    }
-    let detail = MenuItem::new("Ready to connect", false, None);
-    submenu.append(&detail)?;
-    submenu.append(&PredefinedMenuItem::separator())?;
-    let (start, stop) = if interactive {
-        // shortcut: interactive sessions need a TTY; add a Terminal launcher if menu-bar shell access is needed.
-        submenu.append(&MenuItem::new(
-            "Interactive shell · use the TUI",
-            false,
-            None,
-        ))?;
-        (None, None)
-    } else {
-        let start = MenuItem::new("Start Session", true, None);
-        let stop = MenuItem::new("Stop Session", false, None);
-        submenu.append(&start)?;
-        submenu.append(&stop)?;
-        (Some(start), Some(stop))
-    };
+    );
     Ok(ConnectionMenu {
         name: connection.name.clone(),
-        submenu,
-        detail,
-        start,
-        stop,
+        item,
+        state,
+        interactive,
     })
+}
+
+fn connection_text(name: &str, state: ConnectionState, interactive: bool) -> String {
+    if interactive {
+        format!("{name}  TUI only")
+    } else {
+        let action = match state {
+            ConnectionState::Running | ConnectionState::Stopping => "■",
+            ConnectionState::Stopped | ConnectionState::Failed => "▶",
+        };
+        format!("{name}  {action}")
+    }
+}
+
+fn status_color(state: ConnectionState) -> [u8; 3] {
+    match state {
+        ConnectionState::Running => [46, 204, 113],
+        ConnectionState::Stopping => [235, 170, 45],
+        ConnectionState::Stopped => [145, 145, 150],
+        ConnectionState::Failed => [230, 75, 75],
+    }
 }
 
 fn green_pixels(pixels: &[u8]) -> Vec<u8> {
