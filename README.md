@@ -18,10 +18,16 @@ This repository contains the first MVP:
 
 ### Homebrew
 
-The Homebrew formula is maintained in the `ycchuang99/homebrew-ssmux` tap. After the formula is published:
+Install the CLI/TUI:
 
 ```bash
-brew install ycchuang99/ssmux/ssmux
+brew install ycchuang99/tap/ssmux
+```
+
+Install the macOS menu bar app:
+
+```bash
+brew install --cask ycchuang99/tap/ssmux
 ```
 
 `ssmux` also requires the AWS CLI and Session Manager Plugin:
@@ -127,3 +133,11 @@ cargo fmt --check
 cargo test
 cargo clippy --all-targets --all-features -- -D warnings
 ```
+
+## Releases
+
+Pull requests targeting `main` run formatting, Clippy, tests, release builds, and macOS app packaging. Pushes to `main` run the same checks, then create a release for Conventional Commits: `feat` bumps the minor version, `fix`, `perf`, and `revert` bump the patch version, and `!` or a `BREAKING CHANGE` footer bumps the major version. Other commit types do not publish a release.
+
+The release automation updates `Cargo.toml` and `Cargo.lock`, commits the version as `chore(release): VERSION`, pushes a `vVERSION` tag, and publishes the CLI archives and macOS menu bar app bundles. The tag workflow then updates `ycchuang99/homebrew-tap` with the Formula for the CLI/TUI and the Cask for the menu bar app.
+
+Add a repository Actions secret named `RELEASE_TOKEN` with contents write access to both `ycchuang99/ssmux` and `ycchuang99/homebrew-tap`. If branch rules protect `main`, allow this token to push the generated release commit.

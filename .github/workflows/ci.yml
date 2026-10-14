@@ -1,8 +1,6 @@
 name: CI
 
 on:
-  push:
-    branches: [main]
   pull_request:
     branches: [main]
 
@@ -28,6 +26,12 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+
+      - name: Check release versioning script
+        run: python3 scripts/release-version.py self-test
+
+      - name: Check Homebrew updater
+        run: python3 scripts/update-homebrew.py --self-test
 
       - name: Check formatting
         run: cargo fmt --all -- --check
