@@ -41,11 +41,24 @@ jobs:
           TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
+          binary="target/${TARGET}/release/ssmux"
+          version=$("${binary}" --version | awk 'NR == 1 { print $2 }')
+          tag_version="${GITHUB_REF_NAME#v}"
+          if [[ "${version}" != "${tag_version}" ]]; then
+            echo "Git tag ${GITHUB_REF_NAME} does not match Cargo version ${version}" >&2
+            exit 1
+          fi
+
           tar -czf "${ARTIFACT_NAME}.tar.gz" \
             -C "target/${TARGET}/release" \
             ssmux
           if [[ "${RUNNER_OS}" == "macOS" ]]; then
             shasum -a 256 "${ARTIFACT_NAME}.tar.gz" > "${ARTIFACT_NAME}.sha256"
+            scripts/package-macos-menubar.sh "${binary}"
+            menubar_artifact="ssmux-menubar-${GITHUB_REF_NAME}-${TARGET}.zip"
+            ditto -c -k --sequesterRsrc --keepParent \
+              target/ssmux-menubar.app "${menubar_artifact}"
+            shasum -a 256 "${menubar_artifact}" > "${menubar_artifact}.sha256"
           else
             sha256sum "${ARTIFACT_NAME}.tar.gz" > "${ARTIFACT_NAME}.sha256"
           fi
@@ -57,6 +70,16 @@ jobs:
           path: |
             ssmux-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
             ssmux-${{ github.ref_name }}-${{ matrix.target }}.sha256
+          if-no-files-found: error
+
+      - name: Upload menu bar app artifact
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ssmux-menubar-${{ matrix.target }}
+          path: |
+            ssmux-menubar-${{ github.ref_name }}-${{ matrix.target }}.zip
+            ssmux-menubar-${{ github.ref_name }}-${{ matrix.target }}.zip.sha256
           if-no-files-found: error
 
   publish:
@@ -83,4 +106,5 @@ jobs:
             --verify-tag \
             --generate-notes \
             ssmux-*.tar.gz \
+            ssmux-menubar-*.zip \
             ssmux-*.sha256

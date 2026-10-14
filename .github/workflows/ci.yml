@@ -40,3 +40,7 @@ jobs:
 
       - name: Build release binary
         run: cargo build --locked --release
+
+      - name: Package macOS menu bar app
+        if: runner.os == 'macOS'
+        run: scripts/package-macos-menubar.sh target/release/ssmux

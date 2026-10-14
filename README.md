@@ -104,7 +104,7 @@ Configuration changes are loaded when the TUI, menu bar, or `start` command is l
 
 The menu bar uses a monochrome terminal-and-channels icon that adapts to macOS appearance. The icon turns green while sessions are active; no number is displayed. Connected sessions use green status dots in the list. Each connection shows its state, target, AWS region/profile, forwarding endpoint, and last error in its submenu. Choose **New Session…** to open a native form and save a connection; it appears in the list immediately and remains disconnected until you choose **Start Session**. The app bundle includes the matching blue/teal icon. Regenerate the vector-drawn assets on macOS with `swift scripts/generate-icons.swift`.
 
-Run `./scripts/run-macos-menubar.sh` from the source checkout to build and open the menu bar-only bundle using the same `ssmux` executable. Click `ssmux` in the menu bar, choose a connection, then start or stop its background session. Quitting the menu bar process stops sessions it owns. Interactive shell sessions must be started from the TUI.
+Run `./scripts/run-macos-menubar.sh` from the source checkout to build and open the menu bar-only bundle using the same `ssmux` executable. GitHub releases also include a menu bar app bundle for each supported Mac architecture. Click `ssmux` in the menu bar, choose a connection, then start or stop its background session. Quitting the menu bar process stops sessions it owns. Interactive shell sessions must be started from the TUI.
 
 ## TUI controls
 
