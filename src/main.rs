@@ -4,9 +4,14 @@ mod config;
 mod menubar;
 #[cfg(target_os = "macos")]
 mod menubar_form;
+#[cfg(target_os = "macos")]
+mod menubar_popover;
+#[cfg(target_os = "macos")]
+mod menubar_row;
+#[cfg(target_os = "macos")]
 mod session;
+#[cfg(target_os = "macos")]
 mod ssm;
-mod tui;
 
 use std::path::Path;
 
@@ -16,7 +21,6 @@ use clap::Parser;
 use crate::{
     cli::{Cli, Command, ConfigCommand},
     config::{Config, ConnectionConfig},
-    ssm::{is_interactive, spawn_interactive_session, spawn_session},
 };
 
 #[tokio::main]
@@ -28,20 +32,17 @@ async fn main() {
 }
 
 async fn run() -> Result<()> {
-    #[cfg(target_os = "macos")]
-    if std::env::var_os("SSMUX_MENUBAR").is_some() {
-        return menubar::run(&config::default_config_path()).await;
-    }
-
     let cli = Cli::parse();
     let config_path = cli.config.unwrap_or_else(config::default_config_path);
 
-    match cli.command.unwrap_or(Command::Tui) {
-        Command::Tui => tui::run(&config_path).await,
+    match cli.command {
         #[cfg(target_os = "macos")]
-        Command::Menubar => menubar::run(&config_path).await,
-        Command::Start { name } => run_foreground(&config_path, &name).await,
-        Command::Status { json } => {
+        None | Some(Command::Menubar) => menubar::run(&config_path)
+            .await
+            .inspect_err(menubar_form::show_error),
+        #[cfg(not(target_os = "macos"))]
+        None => anyhow::bail!("the menu bar app requires macOS"),
+        Some(Command::Status { json }) => {
             let config = Config::load_or_default(&config_path)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&config.connections)?);
@@ -50,44 +51,9 @@ async fn run() -> Result<()> {
             }
             Ok(())
         }
-        Command::Doctor => doctor(&config_path),
-        Command::Init => init_config(&config_path),
-        Command::Config { command } => config_command(&config_path, command),
-    }
-}
-
-async fn run_foreground(config_path: &Path, name: &str) -> Result<()> {
-    let config = Config::load(config_path)?;
-    let connection = config
-        .connections
-        .iter()
-        .find(|connection| connection.name == name)
-        .with_context(|| format!("unknown connection: {name}"))?;
-    let mut child = if is_interactive(connection) {
-        spawn_interactive_session(connection)
-    } else {
-        spawn_session(connection)
-    }
-    .with_context(|| format!("starting AWS session for {name}"))?;
-    println!("started {name}; press Ctrl-C to stop it");
-
-    tokio::select! {
-        result = child.wait() => {
-            let status = result.context("waiting for AWS session")?;
-            if status.success() {
-                println!("stopped {name}");
-                Ok(())
-            } else {
-                anyhow::bail!("AWS session exited with code {:?}", status.code());
-            }
-        }
-        signal = tokio::signal::ctrl_c() => {
-            signal.context("waiting for Ctrl-C")?;
-            child.start_kill().context("stopping AWS session")?;
-            let _ = child.wait().await;
-            println!("stopped {name}");
-            Ok(())
-        }
+        Some(Command::Doctor) => doctor(&config_path),
+        Some(Command::Init) => init_config(&config_path),
+        Some(Command::Config { command }) => config_command(&config_path, command),
     }
 }
 

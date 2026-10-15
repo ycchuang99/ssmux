@@ -13,72 +13,113 @@ use tao::{
     },
 };
 use tray_icon::{
-    menu::{IconMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem},
-    Icon, TrayIcon, TrayIconBuilder,
+    menu::{
+        accelerator::{Accelerator, Code, Modifiers},
+        Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem, Submenu,
+    },
+    Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent,
 };
 
 use crate::{
     config::{Config, ConnectionConfig},
     menubar_form,
+    menubar_popover::SessionPopover,
     session::{ConnectionState, SessionManager},
-    ssm,
 };
-
-#[derive(Clone, Copy)]
-enum SessionAction {
-    Start,
-    Stop,
-}
 
 struct ConnectionMenu {
     name: String,
-    item: IconMenuItem,
-    state: ConnectionState,
-    interactive: bool,
+    action: MenuId,
+    details: Submenu,
+    edit: MenuItem,
+    status: MenuItem,
+    delete: MenuItem,
+    row: Option<objc2::rc::Retained<crate::menubar_row::ConnectionRow>>,
 }
 
 pub async fn run(config_path: &Path) -> Result<()> {
+    let mtm = objc2::MainThreadMarker::new().context("menu bar requires the main thread")?;
     let mut config = Config::load_or_default(config_path)?;
     let mut manager = SessionManager::new(config.clone());
-    let menu = Menu::new();
-    menu.append(&MenuItem::new("ssmux", false, None))?;
-    let summary = MenuItem::new("No active sessions", false, None);
-    menu.append(&summary)?;
-    let message = MenuItem::new("Click ▶ to start · ■ to stop", false, None);
-    menu.append(&message)?;
-    menu.append(&PredefinedMenuItem::separator())?;
-
     let mut connections = Vec::new();
     for connection in &config.connections {
         let item = build_connection(connection)?;
-        menu.append(&item.item)?;
         connections.push(item);
     }
-    let mut empty_item = if connections.is_empty() {
-        let item = MenuItem::new("No sessions configured", false, None);
-        menu.append(&item)?;
-        Some(item)
-    } else {
-        None
-    };
-    menu.append(&PredefinedMenuItem::separator())?;
-    let add = MenuItem::new("New Session…", true, None);
-    menu.append(&add)?;
-    let quit = MenuItem::new("Quit ssmux & Stop Sessions", true, None);
-    menu.append(&quit)?;
+    let add = MenuItem::new(
+        "New Session…",
+        true,
+        Some(Accelerator::new(Modifiers::META, Code::KeyN)),
+    );
+    let quit = MenuItem::new(
+        "Quit SSMux & Stop Sessions",
+        true,
+        Some(Accelerator::new(Modifiers::META, Code::KeyQ)),
+    );
 
     let idle_pixels = include_bytes!("../assets/menu-template.rgba");
     let icons = [
         Icon::from_rgba(idle_pixels.to_vec(), 36, 36)?,
-        Icon::from_rgba(green_pixels(idle_pixels), 36, 36)?,
+        Icon::from_rgba(active_icon_pixels(idle_pixels)?, 36, 36)?,
     ];
     let mut event_loop = EventLoopBuilder::<MenuEvent>::with_user_event().build();
     event_loop.set_activation_policy(ActivationPolicy::Accessory);
+    // Native edit commands give the form standard Command-C/V/A/Z shortcuts.
+    let app_menu = Menu::new();
+    let application = Submenu::new("SSMux", true);
+    application.append(&add)?;
+    application.append(&PredefinedMenuItem::close_window(None))?;
+    application.append(&PredefinedMenuItem::separator())?;
+    application.append(&quit)?;
+    let edit = Submenu::new("Edit", true);
+    for item in [
+        PredefinedMenuItem::undo(None),
+        PredefinedMenuItem::redo(None),
+        PredefinedMenuItem::separator(),
+        PredefinedMenuItem::cut(None),
+        PredefinedMenuItem::copy(None),
+        PredefinedMenuItem::paste(None),
+        PredefinedMenuItem::select_all(None),
+    ] {
+        edit.append(&item)?;
+    }
+    app_menu.append(&application)?;
+    app_menu.append(&edit)?;
+    app_menu.init_for_nsapp();
+    let panel = SessionPopover::new(
+        event_loop.create_proxy(),
+        add.id().clone(),
+        quit.id().clone(),
+    )?;
+    attach_rows(
+        &panel,
+        &config,
+        &mut connections,
+        &event_loop.create_proxy(),
+    )?;
     let proxy = event_loop.create_proxy();
     MenuEvent::set_event_handler(Some(move |event| {
         let _ = proxy.send_event(event);
     }));
+    let panel_id = MenuId::new("ssmux-panel");
+    let toggle_id = panel_id.clone();
+    let proxy = event_loop.create_proxy();
+    TrayIconEvent::set_event_handler(Some(move |event| {
+        if matches!(
+            event,
+            TrayIconEvent::Click {
+                button: MouseButton::Left | MouseButton::Right,
+                button_state: MouseButtonState::Up,
+                ..
+            }
+        ) {
+            let _ = proxy.send_event(MenuEvent {
+                id: toggle_id.clone(),
+            });
+        }
+    }));
 
+    let row_proxy = event_loop.create_proxy();
     let mut tray = None;
     let mut launch_error = None;
     let mut last_counts = None;
@@ -88,13 +129,14 @@ pub async fn run(config_path: &Path) -> Result<()> {
         match event {
             Event::NewEvents(StartCause::Init) => {
                 match TrayIconBuilder::new()
-                    .with_menu(Box::new(menu.clone()))
                     .with_icon(icons[0].clone())
                     .with_icon_as_template(true)
-                    .with_tooltip("ssmux")
+                    .with_tooltip("SSMux")
                     .build()
                 {
-                    Ok(item) => tray = Some(item),
+                    Ok(item) => {
+                        tray = Some(item);
+                    }
                     Err(error) => {
                         launch_error = Some(error);
                         *control_flow = ControlFlow::Exit;
@@ -102,70 +144,79 @@ pub async fn run(config_path: &Path) -> Result<()> {
                 }
             }
             Event::UserEvent(event) if event.id == quit_id => *control_flow = ControlFlow::Exit,
-            Event::UserEvent(event) if event.id == *add.id() => {
-                let result = (|| -> Result<Option<String>> {
-                    let Some(connection) = menubar_form::new_connection(&config)? else {
-                        return Ok(None);
-                    };
-                    let item = build_connection(&connection)?;
-                    let name = connection.name.clone();
-                    save_new_connection(config_path, &mut config, &mut manager, connection)?;
-                    if let Some(empty) = empty_item.take() {
-                        menu.remove(&empty)?;
-                    }
-                    menu.insert(&item.item, 4 + connections.len())?;
-                    connections.push(item);
-                    last_counts = None;
-                    Ok(Some(name))
-                })();
-                match result {
-                    Ok(Some(name)) => {
-                        set_text(&message, format!("Saved {name} · ready to connect"))
-                    }
-                    Ok(None) => {}
-                    Err(error) => set_text(&message, format!("Could not add session: {error}")),
+            Event::UserEvent(event) if event.id == panel_id => {
+                if let Some(button) = tray
+                    .as_ref()
+                    .and_then(TrayIcon::ns_status_item)
+                    .and_then(|item| item.button(mtm))
+                {
+                    panel.toggle(&button);
                 }
             }
             Event::UserEvent(event) => {
-                if let Some(connection) = connections
-                    .iter()
-                    .find(|connection| *connection.item.id() == event.id)
-                {
-                    let name = connection.name.clone();
-                    let state = manager
-                        .statuses()
-                        .into_iter()
-                        .find(|status| status.name == name)
-                        .map(|status| status.state);
-                    let action = if connection.interactive {
-                        None
-                    } else {
-                        match state {
-                            Some(ConnectionState::Running) => Some(SessionAction::Stop),
-                            Some(ConnectionState::Stopped | ConnectionState::Failed) => {
-                                Some(SessionAction::Start)
-                            }
-                            Some(ConnectionState::Stopping) | None => None,
-                        }
-                    };
-                    if let Some(action) = action {
-                        let result = match action {
-                            SessionAction::Start => manager.start(&name),
-                            SessionAction::Stop => manager.stop(&name),
+                let is_connection_action = connections.iter().any(|item| item.action == event.id);
+                let result = (|| -> Result<()> {
+                    let mut candidate = config.clone();
+                    if event.id == *add.id() {
+                        panel.close();
+                        let Some(connection) = menubar_form::edit_connection(&config, None)? else {
+                            return Ok(());
                         };
-                        set_text(
-                            &message,
-                            match result {
-                                Ok(()) => format!(
-                                    "{} {name}",
-                                    match action {
-                                        SessionAction::Start => "Started",
-                                        SessionAction::Stop => "Stopping",
-                                    }
-                                ),
-                                Err(error) => format!("{name}: {error}"),
-                            },
-                        );
+                        candidate.connections.push(connection);
+                    } else if let Some(index) = connections.iter().position(|connection| {
+                        *connection.edit.id() == event.id || *connection.delete.id() == event.id
+                    }) {
+                        panel.close();
+                        let connection = &config.connections[index];
+                        if event.id == *connections[index].edit.id() {
+                            let Some(edited) =
+                                menubar_form::edit_connection(&config, Some(connection))?
+                            else {
+                                return Ok(());
+                            };
+                            candidate.connections[index] = edited;
+                        } else {
+                            if !menubar_form::confirm_delete(&connection.name)? {
+                                return Ok(());
+                            }
+                            candidate.connections.remove(index);
+                        }
+                    } else if let Some(connection) =
+                        connections.iter().find(|item| item.action == event.id)
+                    {
+                        let name = &connection.name;
+                        let state = manager
+                            .statuses()
+                            .into_iter()
+                            .find(|status| status.name == *name)
+                            .map(|status| status.state);
+                        match state {
+                            Some(ConnectionState::Running) => {
+                                manager.stop(name)?;
+                            }
+                            Some(ConnectionState::Stopped | ConnectionState::Failed) => {
+                                manager.start(name)?;
+                            }
+                            _ => {}
+                        }
+                        return Ok(());
+                    } else {
+                        return Ok(());
+                    }
+                    save_config(config_path, &mut config, &mut manager, candidate)?;
+                    connections = config
+                        .connections
+                        .iter()
+                        .map(build_connection)
+                        .collect::<Result<_>>()?;
+                    attach_rows(&panel, &config, &mut connections, &row_proxy)?;
+                    last_counts = None;
+                    Ok(())
+                })();
+                if let Err(error) = result {
+                    panel.set_summary(&format!("Action Failed: {error}"));
+                    if !is_connection_action {
+                        menubar_form::show_error(&error);
                     }
                 }
             }
@@ -175,19 +226,21 @@ pub async fn run(config_path: &Path) -> Result<()> {
                     if let Err(error) = update_menu(
                         &manager,
                         &mut connections,
-                        &summary,
-                        &message,
+                        &panel,
                         tray,
                         &icons,
                         &mut last_counts,
                     ) {
-                        set_text(&message, format!("Could not update status icon: {error}"));
+                        panel.set_summary(&format!("Could not update status icon: {error}"));
                     }
                 }
             }
             _ => {}
         }
     });
+    panel.close();
+    TrayIconEvent::set_event_handler(None::<fn(TrayIconEvent)>);
+    MenuEvent::set_event_handler(None::<fn(MenuEvent)>);
     drop(tray);
     manager.shutdown().await;
     if let Some(error) = launch_error {
@@ -205,8 +258,7 @@ fn set_text(item: &MenuItem, text: String) {
 fn update_menu(
     manager: &SessionManager,
     connections: &mut [ConnectionMenu],
-    summary: &MenuItem,
-    message: &MenuItem,
+    panel: &SessionPopover,
     tray: &TrayIcon,
     icons: &[Icon; 2],
     last_counts: &mut Option<(usize, usize)>,
@@ -227,10 +279,10 @@ fn update_menu(
         .count();
     if *last_counts != Some((active, failed)) {
         let text = format!(
-            "{active} active · {failed} failed · {} configured",
+            "{active} Running · {failed} Failed · {} Saved",
             statuses.len()
         );
-        set_text(summary, text);
+        panel.set_summary(&text);
         tray.set_icon_with_as_template(Some(icons[usize::from(active > 0)].clone()), active == 0)?;
         *last_counts = Some((active, failed));
     }
@@ -238,101 +290,126 @@ fn update_menu(
         let Some(status) = statuses.iter().find(|s| s.name == connection.name) else {
             continue;
         };
-        if connection.state != status.state {
-            connection.item.set_text(connection_text(
-                &connection.name,
-                status.state,
-                connection.interactive,
-            ));
-            connection
-                .item
-                .set_icon(Some(status_dot(status_color(status.state))?));
-            if status.state == ConnectionState::Failed {
-                if let Some(error) = &status.last_error {
-                    set_text(message, format!("{}: {error}", connection.name));
-                }
-            }
-            connection.state = status.state;
+        if let Some(row) = &connection.row {
+            row.update(status.state, status.last_error.as_deref());
         }
-        let can_run = !connection.interactive && status.state != ConnectionState::Stopping;
-        if connection.item.is_enabled() != can_run {
-            connection.item.set_enabled(can_run);
-        }
+        let state_text = match status.state {
+            ConnectionState::Running => "Running",
+            ConnectionState::Stopping => "Stopping…",
+            ConnectionState::Stopped => "Ready to Connect",
+            ConnectionState::Failed => status.last_error.as_deref().unwrap_or("Connection Failed"),
+        };
+        set_text(&connection.status, state_text.to_owned());
+        let can_edit = matches!(
+            status.state,
+            ConnectionState::Stopped | ConnectionState::Failed
+        );
+        connection.edit.set_enabled(can_edit);
+        connection.delete.set_enabled(can_edit);
     }
     Ok(())
 }
 
 fn build_connection(connection: &ConnectionConfig) -> Result<ConnectionMenu> {
-    let interactive = ssm::is_interactive(connection);
-    let state = ConnectionState::Stopped;
-    let item = IconMenuItem::new(
-        connection_text(&connection.name, state, interactive),
-        !interactive,
-        Some(status_dot(status_color(state))?),
-        None,
-    );
+    let action = MenuId::new(format!("connection:{}", connection.name));
+    let details = Submenu::new(connection_route(connection), true);
+    let status = MenuItem::new("Ready to Connect", false, None);
+    details.append(&MenuItem::new("Manage", false, None))?;
+    details.append(&status)?;
+    let destination = connection
+        .parameters
+        .get("host")
+        .map(String::as_str)
+        .unwrap_or(&connection.target);
+    for text in [
+        format!("Destination: {destination}"),
+        format!("SSM Target: {}", connection.target),
+        format!(
+            "{} · {}",
+            connection.region.as_deref().unwrap_or("Default Region"),
+            connection.profile.as_deref().unwrap_or("Default Profile")
+        ),
+    ] {
+        details.append(&MenuItem::new(text, false, None))?;
+    }
+    details.append(&PredefinedMenuItem::separator())?;
+    let edit = MenuItem::new("Edit Session…", true, None);
+    let delete = MenuItem::new("Delete Session…", true, None);
+    details.append(&edit)?;
+    details.append(&delete)?;
     Ok(ConnectionMenu {
         name: connection.name.clone(),
-        item,
-        state,
-        interactive,
+        action,
+        details,
+        status,
+        edit,
+        delete,
+        row: None,
     })
 }
 
-fn connection_text(name: &str, state: ConnectionState, interactive: bool) -> String {
-    if interactive {
-        format!("{name}  TUI only")
-    } else {
-        let action = match state {
-            ConnectionState::Running | ConnectionState::Stopping => "■",
-            ConnectionState::Stopped | ConnectionState::Failed => "▶",
-        };
-        format!("{name}  {action}")
+pub(crate) fn connection_route(connection: &ConnectionConfig) -> String {
+    match (
+        connection.parameters.get("localPortNumber"),
+        connection.parameters.get("portNumber"),
+    ) {
+        (Some(local), Some(remote)) => format!("localhost:{local} → remote:{remote}"),
+        _ => "Connection Details".to_owned(),
     }
 }
 
-fn status_color(state: ConnectionState) -> [u8; 3] {
-    match state {
-        ConnectionState::Running => [46, 204, 113],
-        ConnectionState::Stopping => [235, 170, 45],
-        ConnectionState::Stopped => [145, 145, 150],
-        ConnectionState::Failed => [230, 75, 75],
-    }
-}
-
-fn green_pixels(pixels: &[u8]) -> Vec<u8> {
-    pixels
+fn active_icon_pixels(pixels: &[u8]) -> Result<Vec<u8>> {
+    use objc2_app_kit::{NSColor, NSColorSpace};
+    let color = NSColor::systemGreenColor()
+        .colorUsingColorSpace(&NSColorSpace::sRGBColorSpace())
+        .context("resolving status color")?;
+    let color = [
+        color.redComponent(),
+        color.greenComponent(),
+        color.blueComponent(),
+    ]
+    .map(|channel| (channel.clamp(0., 1.) * 255.).round() as u8);
+    Ok(pixels
         .as_chunks::<4>()
         .0
         .iter()
-        .flat_map(|pixel| [46, 204, 113, pixel[3]])
-        .collect()
+        .flat_map(|pixel| [color[0], color[1], color[2], pixel[3]])
+        .collect())
 }
 
-fn status_dot(color: [u8; 3]) -> Result<tray_icon::menu::Icon> {
-    let mut pixels = Vec::with_capacity(16 * 16 * 4);
-    for y in 0..16 {
-        for x in 0..16 {
-            let distance = ((x as f64 - 7.5).powi(2) + (y as f64 - 7.5).powi(2)).sqrt();
-            let alpha = ((5.5 - distance).clamp(0., 1.) * 255.) as u8;
-            pixels.extend_from_slice(&[color[0], color[1], color[2], alpha]);
-        }
+fn attach_rows(
+    panel: &SessionPopover,
+    config: &Config,
+    connections: &mut [ConnectionMenu],
+    proxy: &tao::event_loop::EventLoopProxy<MenuEvent>,
+) -> Result<()> {
+    for (connection, item) in config.connections.iter().zip(connections.iter_mut()) {
+        item.row = Some(crate::menubar_row::ConnectionRow::new(
+            connection,
+            &item.details,
+            item.action.clone(),
+            proxy.clone(),
+        )?);
     }
-    tray_icon::menu::Icon::from_rgba(pixels, 16, 16).context("creating the status dot")
+    panel.set_rows(
+        &connections
+            .iter()
+            .filter_map(|item| item.row.as_ref().map(|row| row.view()))
+            .collect::<Vec<_>>(),
+    );
+    Ok(())
 }
 
-fn save_new_connection(
+fn save_config(
     path: &Path,
     config: &mut Config,
     manager: &mut SessionManager,
-    connection: ConnectionConfig,
+    candidate: Config,
 ) -> Result<()> {
     if Config::load_or_default(path)?.connections != config.connections {
-        anyhow::bail!("configuration changed outside SSMux; restart it before adding a session");
+        anyhow::bail!("configuration changed outside SSMux; restart it before saving changes");
     }
-    let mut candidate = config.clone();
-    candidate.connections.push(connection);
-    candidate.validate()?;
+    manager.validate_reload(&candidate)?;
     candidate.save_atomic(path)?;
     manager.reload_config(candidate.clone())?;
     *config = candidate;
@@ -345,9 +422,33 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
-    fn adding_a_session_persists_and_updates_manager_without_overwriting_external_edits() {
+    fn route_shows_local_and_remote_ports_without_exposing_a_long_hostname() {
+        let connection = ConnectionConfig {
+            name: "test".into(),
+            target: "i-test".into(),
+            region: None,
+            profile: None,
+            document_name: None,
+            extra_args: vec![],
+            parameters: std::collections::BTreeMap::from([
+                ("host".into(), "db.example.test".into()),
+                ("localPortNumber".into(), "13308".into()),
+                ("portNumber".into(), "3306".into()),
+            ]),
+        };
+        assert_eq!(
+            connection_route(&connection),
+            "localhost:13308 → remote:3306"
+        );
+        let mut custom = connection;
+        custom.parameters.clear();
+        assert_eq!(connection_route(&custom), "Connection Details");
+    }
+
+    #[test]
+    fn crud_persists_updates_manager_and_rejects_external_edits_and_invalid_changes() {
         let directory = std::env::temp_dir().join(format!(
-            "ssmux-add-session-{}-{}",
+            "ssmux-crud-{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -366,26 +467,40 @@ mod tests {
             parameters: Default::default(),
             extra_args: vec![],
         };
-        save_new_connection(&path, &mut config, &mut manager, connection.clone()).unwrap();
-        assert_eq!(
-            Config::load(&path).unwrap().connections,
-            vec![connection.clone()]
-        );
+        let mut candidate = config.clone();
+        candidate.connections.push(connection);
+        save_config(&path, &mut config, &mut manager, candidate).unwrap();
+        assert_eq!(Config::load(&path).unwrap().connections, config.connections);
         assert_eq!(manager.statuses()[0].name, "new");
-        assert_eq!(manager.statuses()[0].state, ConnectionState::Stopped);
+        let mut candidate = config.clone();
+        candidate.connections[0].name = "renamed".into();
+        candidate.connections[0].target = "i-456".into();
+        save_config(&path, &mut config, &mut manager, candidate).unwrap();
+        assert_eq!(manager.statuses()[0].name, "renamed");
+        assert_eq!(Config::load(&path).unwrap().connections[0].target, "i-456");
+        let mut invalid = config.clone();
+        invalid.connections.push(invalid.connections[0].clone());
+        assert!(save_config(&path, &mut config, &mut manager, invalid).is_err());
+        assert_eq!(Config::load(&path).unwrap().connections, config.connections);
+        let blocked_temporary = path.with_extension("toml.tmp");
+        std::fs::create_dir(&blocked_temporary).unwrap();
+        assert!(save_config(&path, &mut config, &mut manager, Config::default()).is_err());
+        assert_eq!(Config::load(&path).unwrap().connections, config.connections);
+        assert_eq!(manager.statuses().len(), 1);
+        std::fs::remove_dir(blocked_temporary).unwrap();
         let mut external = config.clone();
-        let mut outside = connection.clone();
-        outside.name = "external".into();
-        external.connections.push(outside);
+        external.connections[0].region = Some("us-east-1".into());
         external.save_atomic(&path).unwrap();
-        let mut another = connection;
-        another.name = "another".into();
-        assert!(save_new_connection(&path, &mut config, &mut manager, another).is_err());
+        assert!(save_config(&path, &mut config, &mut manager, Config::default()).is_err());
         assert_eq!(
             Config::load(&path).unwrap().connections,
             external.connections
         );
         assert_eq!(manager.statuses().len(), 1);
+        config.save_atomic(&path).unwrap();
+        save_config(&path, &mut config, &mut manager, Config::default()).unwrap();
+        assert!(Config::load(&path).unwrap().connections.is_empty());
+        assert!(manager.statuses().is_empty());
         std::fs::remove_dir_all(directory).unwrap();
     }
 }

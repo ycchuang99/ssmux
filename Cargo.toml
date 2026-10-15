@@ -1,8 +1,8 @@
 [package]
 name = "ssmux"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
-description = "A terminal manager for AWS SSM sessions"
+description = "A macOS menu bar manager for AWS SSM sessions"
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/ycchuang99/ssmux"
@@ -11,9 +11,7 @@ homepage = "https://github.com/ycchuang99/ssmux"
 [dependencies]
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
-crossterm = "0.28"
 directories = "6.0"
-ratatui = "0.29"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1.42", features = [
@@ -21,14 +19,47 @@ tokio = { version = "1.42", features = [
     "macros",
     "process",
     "rt-multi-thread",
-    "signal",
     "time",
 ] }
 toml = "0.8"
 
 [target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
 tao = "0.37.1"
 tray-icon = { version = "0.25.1", default-features = false }
 objc2 = "0.6"
-objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSString", "NSGeometry"] }
-objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSAlert", "NSApplication", "NSButton", "NSControl", "NSFont", "NSResponder", "NSScrollView", "NSText", "NSTextField", "NSTextView", "NSView", "NSWindow"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSString", "NSGeometry", "NSNotification", "NSObject", "NSValue"] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "NSAlert",
+    "NSApplication",
+    "NSButton",
+    "NSButtonCell",
+    "NSColor",
+    "NSColorSpace",
+    "NSAccessibilityProtocols",
+    "NSAccessibility",
+    "NSWorkspace",
+    "NSControl",
+    "NSFont",
+    "NSFontDescriptor",
+    "NSResponder",
+    "NSScrollView",
+    "NSText",
+    "NSTextField",
+    "NSTextFieldCell",
+    "NSTextView",
+    "NSView",
+    "NSWindow",
+    "NSPanel",
+    "NSPopover",
+    "NSViewController",
+    "NSStatusItem",
+    "NSStatusBarButton",
+    "NSGraphics",
+    "NSPopUpButton",
+    "NSMenu",
+    "NSImage",
+    "NSActionCell",
+    "NSCell",
+] }

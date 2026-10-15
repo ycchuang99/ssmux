@@ -95,8 +95,8 @@ pub fn default_config_path() -> PathBuf {
 
 pub fn example_config() -> &'static str {
     r#"# ssmux connection configuration
-# Run `ssmux` after editing this file to open the TUI.
-# Add connections from the TUI with `n`, or use `ssmux config add`.
+# Run `ssmux` to open the macOS menu bar app.
+# Choose New Session in the menu bar to add a connection.
 "#
 }
 

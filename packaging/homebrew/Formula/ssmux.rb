@@ -1,5 +1,5 @@
 class Ssmux < Formula
-  desc "Terminal manager for AWS SSM tunnels"
+  desc "Menu bar manager and configuration tools for AWS SSM"
   homepage "https://github.com/ycchuang99/ssmux"
   version "__VERSION__"
   license "MIT"

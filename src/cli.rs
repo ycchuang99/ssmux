@@ -8,7 +8,7 @@ use crate::config::ConnectionConfig;
 #[command(
     name = "ssmux",
     version,
-    about = "A terminal manager for AWS SSM sessions"
+    about = "A macOS menu bar manager for AWS SSM sessions"
 )]
 pub struct Cli {
     /// Path to the TOML configuration file.
@@ -21,14 +21,10 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Open the terminal user interface.
-    Tui,
     #[cfg(target_os = "macos")]
     /// Run a menu bar-only session controller on macOS.
     Menubar,
-    /// Run one configured session in the foreground; Ctrl-C stops it.
-    Start { name: String },
-    /// List configured connections. Live state belongs to the current TUI or menu bar process.
+    /// List configured connections. Live state belongs to the menu bar process.
     Status {
         /// Print machine-readable JSON.
         #[arg(long)]
@@ -101,5 +97,19 @@ pub fn print_configurations(configurations: &[ConnectionConfig]) {
             configuration.target,
             configuration.region.as_deref().unwrap_or("-")
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn removed_interfaces_are_rejected_and_default_launch_accepts_config() {
+        assert!(Cli::try_parse_from(["ssmux", "tui"]).is_err());
+        assert!(Cli::try_parse_from(["ssmux", "start", "demo"]).is_err());
+        let cli = Cli::try_parse_from(["ssmux", "--config", "/tmp/demo.toml"]).unwrap();
+        assert!(cli.command.is_none());
+        assert_eq!(cli.config.unwrap(), PathBuf::from("/tmp/demo.toml"));
     }
 }

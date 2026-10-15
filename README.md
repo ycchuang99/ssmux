@@ -1,100 +1,51 @@
-# ssmux
+# SSMux
 
-`ssmux` is a Rust terminal manager for AWS Systems Manager sessions, designed to work like K9s: the TUI directly owns the sessions it starts. There is no daemon and no persistent connection mode in this version.
-
-## Status
-
-This repository contains the first MVP:
-
-- Rust + Tokio + Ratatui + Crossterm
-- TOML connection configuration
-- Configuration CRUD through `ssmux config`
-- AWS CLI `ssm start-session` child-process lifecycle management
-- `start`, `status`, `doctor`, `init`, and `config` commands
-- TUI keyboard controls for selecting, starting, and stopping sessions
-- A macOS menu bar mode in the same executable
+A macOS menu bar manager for AWS Systems Manager port-forwarding sessions. Start and stop connections from the menu bar, with no terminal window or daemon. Quitting SSMux stops the sessions and plugin processes it owns.
 
 ## Installation
-
-### Homebrew
-
-Install the CLI/TUI:
-
-```bash
-brew install ycchuang99/tap/ssmux
-```
-
-Install the macOS menu bar app:
 
 ```bash
 brew install --cask ycchuang99/tap/ssmux
 ```
 
-`ssmux` also requires the AWS CLI and Session Manager Plugin:
+Requires macOS, AWS CLI v2, the AWS Session Manager Plugin, and an AWS profile permitted to start your configured sessions. Homebrew installs the local command dependencies with the app.
+
+From source:
 
 ```bash
-brew install awscli
-brew install --cask session-manager-plugin
+./scripts/run-macos-menubar.sh
 ```
 
-### Build from source
+The script builds and opens `target/SSMux.app`.
+
+App bundles are ad-hoc signed, not Developer ID signed or notarized. macOS may require you to allow a downloaded app in Privacy & Security before its first launch.
+
+Or run `cargo run --release` to launch the menu bar directly. `ssmux menubar` remains an explicit launch command. No arguments open only the menu bar; use `--config PATH` to select a different configuration file.
+
+## Using the menu bar
+
+- **New Session…** opens a resizable native editor. Choose **Remote Host**, **SSM Instance**, or **Custom Document**, then fill in the labeled host and port fields. Validation stays in the editor; saving does not start a session.
+- Click the menu bar icon to open your sessions. The connection button is gray when ready, green while running, orange while stopping, and red on failure. Its gentle pulse indicates a running session, not measured network traffic, and respects macOS Reduce Motion.
+- Click the connection button to connect or disconnect. The panel stays open, including after a connection failure; click outside to dismiss it. The menu bar icon turns green while sessions are active.
+- The route below the name shows **localhost:PORT → remote:PORT**. Open **Manage** for live status, destination, SSM target, region, profile, **Edit Session…**, and **Delete Session…**. Deletion requires confirmation; Cancel is the default action.
+- Use **⌘N** for a new session and standard **⌘C/V/A/Z** shortcuts in the form. Stop an active session before editing or deleting it. Changes appear immediately and are saved atomically. If another process changes your configuration, SSMux refuses to overwrite it; restart the app to load those changes.
+
+The editor uses your AWS defaults when region or profile is blank. **Remote Host** and **SSM Instance** choose the matching AWS forwarding document automatically and validate ports from 1 to 65535. **Advanced Settings** contains the document name and additional `key=value` parameters; choose **Custom Document** to edit the document name. Editing preserves custom parameters and any `extra_args` configured in TOML.
+
+Interactive shell and SSH documents need a terminal and cannot run in the menu bar. Existing definitions remain saved and can be edited or removed.
+
+### Upgrading from 0.3.x
+
+Version 0.4.0 opens the menu bar by default and installs as `SSMux.app`. The terminal interface and foreground `start` command have been removed; configuration and diagnostic commands remain available. Your existing configuration is preserved. Quit the old app before opening the new version; quitting stops its active sessions.
+
+## Configuration and diagnostics
+
+The default configuration path is `~/.ssmux/config.toml`. The app starts with an empty list if the file does not exist. You can also use the command-line configuration and diagnostic tools:
 
 ```bash
-cargo build --release
-sudo install -m 0755 target/release/ssmux /usr/local/bin/ssmux
-```
-
-## Requirements
-
-- AWS CLI v2
-- Session Manager Plugin
-- An AWS profile with permission to start the configured SSM session
-
-Rust is only required when building `ssmux` from source.
-
-## Quick start
-
-```bash
-cargo build --release
-./target/release/ssmux init
-./target/release/ssmux doctor
-./target/release/ssmux
-```
-
-In another terminal:
-
-```bash
-./target/release/ssmux status
-./target/release/ssmux start demo-stage
-```
-
-`ssmux start NAME` runs one session in the foreground; press `Ctrl-C` to stop it. `ssmux status` lists configured connections, while live state is shown by a running TUI or menu bar process.
-
-The default configuration path is `~/.ssmux/config.toml`. Override it with `--config PATH`.
-
-## Configuration
-
-`ssmux init` creates an empty configuration file. Use `n` in the TUI to add a connection, or use the CLI commands below. A connection has this shape:
-
-```toml
-[[connections]]
-name = "demo-stage"
-target = "i-0deadbeefdeadbeef0"
-region = "us-west-2"
-document_name = "AWS-StartPortForwardingSession"
-
-[connections.parameters]
-portNumber = "22"
-localPortNumber = "10022"
-```
-
-The session runner translates each connection into an AWS CLI command. Parameter order is deterministic. Extra AWS CLI arguments can be supplied with `extra_args` when needed.
-
-For remote-host forwarding, use `AWS-StartPortForwardingSessionToRemoteHost` and add `host`, `portNumber`, and `localPortNumber` parameters.
-
-Connection definitions can also be managed without opening the TUI:
-
-```bash
+ssmux init
+ssmux doctor
+ssmux status --json
 ssmux config list
 ssmux config add demo-db --target i-0deadbeefdeadbeef0 \
   --region us-west-2 --document-name AWS-StartPortForwardingSessionToRemoteHost \
@@ -104,40 +55,42 @@ ssmux config edit demo-db --region us-east-1
 ssmux config remove demo-db
 ```
 
-Configuration changes are loaded when the TUI, menu bar, or `start` command is launched.
+`status` lists saved definitions; live process state is shown in the running menu bar. Restart the app after editing the configuration outside SSMux. The Homebrew Formula installs these command-line tools; the Cask installs the menu bar app bundle.
 
-## macOS menu bar
+A connection has this shape:
 
-The menu bar uses a monochrome terminal-and-channels icon that adapts to macOS appearance. The icon turns green while sessions are active; no number is displayed. Each connection is a direct menu item with a colored status dot and a trailing ▶/■ action: click to start or stop it. Interactive sessions must be started from the TUI. Choose **New Session…** to open a native form and save a connection; it appears in the list immediately. The app bundle includes the matching blue/teal icon. Regenerate the vector-drawn assets on macOS with `swift scripts/generate-icons.swift`.
+```toml
+[[connections]]
+name = "Staging database"
+target = "i-0deadbeefdeadbeef0"
+region = "us-west-2"
+document_name = "AWS-StartPortForwardingSession"
 
-Run `./scripts/run-macos-menubar.sh` from the source checkout to build and open the menu bar-only bundle using the same `ssmux` executable. GitHub releases also include a menu bar app bundle for each supported Mac architecture. Click `ssmux` in the menu bar, then click a connection's ▶ or ■ action to start or stop its background session. Quitting the menu bar process stops sessions it owns.
+[connections.parameters]
+portNumber = "5432"
+localPortNumber = "15432"
+```
 
-## TUI controls
-
-- `↑` / `↓` or `j` / `k`: select a connection
-- Click a header action; session actions apply to the selected connection
-- `n`: add a connection
-- `e`: edit the selected connection
-- `d`: ask for confirmation, then delete the selected connection
-- `s`: start the selected connection
-- `x`: stop the selected connection
-- `/`: open the connection filter; press `Enter` or `Esc` to close it
-- `q`, `Esc`, or `Ctrl-C`: quit the TUI
-
-In the connection form, the Document field is a selector for the common SSM documents. Use `↑` / `↓` to change it. Parameters appear as a Key / Value table; press `Tab` from the last Value to add another row and `Ctrl-D` to remove the current row.
+Parameters are passed as JSON to the AWS CLI, preserving commas, quotes, and spaces in values. Extra AWS CLI arguments can be supplied with `extra_args`.
 
 ## Development
 
 ```bash
-cargo fmt --check
-cargo test
+cargo fmt --all -- --check
+cargo test --all-features
 cargo clippy --all-targets --all-features -- -D warnings
+cargo build --locked --release
+scripts/package-macos-menubar.sh target/release/ssmux
 ```
+
+Session lifecycle tests use local child processes and do not contact AWS. macOS builds also test menu-bar persistence and form validation. Linux builds provide configuration/diagnostic tools only.
+
+Regenerate the app and menu bar icons on macOS with `swift scripts/generate-icons.swift`.
 
 ## Releases
 
 Pull requests targeting `main` run formatting, Clippy, tests, release builds, and macOS app packaging. Pushes to `main` run the same checks, then create a release for Conventional Commits: `feat` bumps the minor version, `fix`, `perf`, and `revert` bump the patch version, and `!` or a `BREAKING CHANGE` footer bumps the major version. Other commit types do not publish a release.
 
-The release automation updates `Cargo.toml` and `Cargo.lock`, commits the version as `chore(release): VERSION`, pushes a `vVERSION` tag, and publishes the CLI archives and macOS menu bar app bundles. The tag workflow then updates `ycchuang99/homebrew-tap` with the Formula for the CLI/TUI and the Cask for the menu bar app.
+The release automation updates `Cargo.toml` and `Cargo.lock`, commits the version as `chore(release): VERSION`, pushes a `vVERSION` tag, and publishes the CLI archives and macOS menu bar app bundles. The tag workflow then updates `ycchuang99/homebrew-tap` with the Formula for the configuration tools and the Cask for the menu bar app.
 
 Add a repository Actions secret named `RELEASE_TOKEN` with contents write access to both `ycchuang99/ssmux` and `ycchuang99/homebrew-tap`. If branch rules protect `main`, allow this token to push the generated release commit.

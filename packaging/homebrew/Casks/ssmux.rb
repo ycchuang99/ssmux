@@ -11,12 +11,12 @@ cask "ssmux" do
     sha256 "__MENUBAR_X86_64_SHA256__"
   end
 
-  name "ssmux"
+  name "SSMux"
   desc "Menu bar controller for AWS Systems Manager sessions"
   homepage "https://github.com/ycchuang99/ssmux"
 
   depends_on cask: "session-manager-plugin"
   depends_on formula: "awscli"
 
-  app "ssmux-menubar.app"
+  app "SSMux.app"
 end

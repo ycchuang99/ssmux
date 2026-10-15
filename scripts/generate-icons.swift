@@ -41,6 +41,9 @@ func render(size: Int, template: Bool) throws -> (Data, Data) {
                             bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
     context.scaleBy(x: CGFloat(size) / 100, y: CGFloat(size) / 100)
     if template {
+        context.translateBy(x: 50, y: 50)
+        context.scaleBy(x: 1.18, y: 1.18)
+        context.translateBy(x: -50, y: -50)
         symbol(context, color: CGColor(gray: 0, alpha: 1))
     } else {
         context.saveGState()
@@ -70,19 +73,13 @@ func render(size: Int, template: Bool) throws -> (Data, Data) {
     return (png, pixels)
 }
 
-let (template, pixels) = try render(size: 36, template: true)
-try template.write(to: assets.appendingPathComponent("menu-template.png"))
+let (_, pixels) = try render(size: 36, template: true)
 try pixels.write(to: assets.appendingPathComponent("menu-template.rgba"))
-let (preview, _) = try render(size: 256, template: false)
-try preview.write(to: assets.appendingPathComponent("app-icon-preview.png"))
 for size in [16, 32, 128, 256, 512] {
     for scale in [1, 2] {
         let (png, _) = try render(size: size * scale, template: false)
         let suffix = scale == 2 ? "@2x" : ""
         try png.write(to: iconset.appendingPathComponent("icon_\(size)x\(size)\(suffix).png"))
-        if size * scale == 1024 {
-            try png.write(to: assets.appendingPathComponent("app-icon.png"))
-        }
     }
 }
 let task = Process()

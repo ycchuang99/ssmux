@@ -57,7 +57,7 @@ jobs:
             scripts/package-macos-menubar.sh "${binary}"
             menubar_artifact="ssmux-menubar-${GITHUB_REF_NAME}-${TARGET}.zip"
             ditto -c -k --sequesterRsrc --keepParent \
-              target/ssmux-menubar.app "${menubar_artifact}"
+              target/SSMux.app "${menubar_artifact}"
             shasum -a 256 "${menubar_artifact}" > "${menubar_artifact}.sha256"
           else
             sha256sum "${ARTIFACT_NAME}.tar.gz" > "${ARTIFACT_NAME}.sha256"
