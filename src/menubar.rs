@@ -37,13 +37,13 @@ struct ConnectionMenu {
     recovery: MenuId,
     details: Submenu,
     edit: MenuItem,
-    status: MenuItem,
     delete: MenuItem,
     duplicate: MenuItem,
     copy: MenuItem,
     pin: MenuItem,
     diagnostics: MenuItem,
     sign_in: MenuItem,
+    sign_in_visible: bool,
     row: Option<objc2::rc::Retained<crate::menubar_row::ConnectionRow>>,
 }
 
@@ -114,6 +114,7 @@ pub async fn run(config_path: &Path) -> Result<()> {
         &panel,
         &config,
         &mut connections,
+        &search_id,
         &event_loop.create_proxy(),
     )?;
     let proxy = event_loop.create_proxy();
@@ -171,7 +172,7 @@ pub async fn run(config_path: &Path) -> Result<()> {
                     if event.id == *setup.id() {
                         show_setup = true;
                         if setup_task.is_none() { setup_task = Some(discover_settings(setup_tx.clone())); }
-                        panel.set_notice("Checking AWS CLI, Session Manager Plugin and local profiles…");
+                        panel.set_setup_status("Checking local setup…");
                         return Ok(());
                     }
                     let mut candidate = config.clone();
@@ -185,7 +186,7 @@ pub async fn run(config_path: &Path) -> Result<()> {
                         let status = manager.statuses().into_iter().find(|status| status.name == item.name).context("session not found")?;
                         if event.id == *item.copy.id() {
                             copy_text(&local_address(connection).context("this session has no local port")?)?;
-                            panel.set_notice("Local address copied. Paste it into your database or other client.");
+                            panel.set_feedback("Address copied");
                             return Ok(());
                         } else if event.id == *item.diagnostics.id() {
                             panel.close(); show_diagnostics(&status)?; return Ok(());
@@ -223,7 +224,7 @@ pub async fn run(config_path: &Path) -> Result<()> {
                         } else if event.id == item.recovery && status.failure_kind == Some(FailureKind::MissingDependency) {
                             show_setup = true;
                             if setup_task.is_none() { setup_task = Some(discover_settings(setup_tx.clone())); }
-                            panel.set_notice("Checking local AWS setup…");
+                            panel.set_setup_status("Checking local setup…");
                             return Ok(());
                         } else if event.id == item.recovery && !matches!(status.failure_kind, Some(FailureKind::Network | FailureKind::Timeout)) {
                             panel.close(); show_diagnostics(&status)?; return Ok(());
@@ -238,7 +239,7 @@ pub async fn run(config_path: &Path) -> Result<()> {
                     } else { return Ok(()); }
                     save_config(config_path, &mut config, &mut manager, candidate)?;
                     connections = config.connections.iter().map(build_connection).collect::<Result<_>>()?;
-                    attach_rows(&panel, &config, &mut connections, &row_proxy)?;
+                    attach_rows(&panel, &config, &mut connections, &search_id, &row_proxy)?;
                     last_counts = None;
                     Ok(())
                 })();
@@ -251,7 +252,7 @@ pub async fn run(config_path: &Path) -> Result<()> {
                 if let Ok(settings) = setup_rx.try_recv() {
                     aws = settings; setup_task = None;
                     let summary = aws.summary();
-                    panel.set_notice(if aws.issues.is_empty() { "Local setup checked. AWS access and tunnel readiness are checked when connecting." } else { "Local setup needs attention. Use Check Setup for details." });
+                    panel.set_setup_status(if aws.issues.is_empty() { "Local setup checked" } else { "Setup needs attention" });
                     if show_setup {
                         show_setup = false; panel.close();
                         if let Err(error) = show_information("Local AWS Setup", &summary) { panel.set_notice(&error.to_string()); }
@@ -332,6 +333,29 @@ fn can_edit(state: ConnectionState) -> bool {
     )
 }
 
+fn session_summary(saved: usize, ready: usize, pending: usize, problems: usize) -> String {
+    let mut parts = vec![format!(
+        "{saved} {}",
+        if saved == 1 { "Session" } else { "Sessions" }
+    )];
+    for (count, label) in [
+        (ready, "Ready"),
+        (pending, "Pending"),
+        (problems, if problems == 1 { "Issue" } else { "Issues" }),
+    ] {
+        if count > 0 {
+            parts.push(format!("{count} {label}"));
+        }
+    }
+    parts.join(" · ")
+}
+
+fn set_enabled(item: &MenuItem, enabled: bool) {
+    if item.is_enabled() != enabled {
+        item.set_enabled(enabled);
+    }
+}
+
 impl ConnectionMenu {
     fn owns(&self, id: &MenuId) -> bool {
         *id == self.action
@@ -346,12 +370,6 @@ impl ConnectionMenu {
                 self.sign_in.id(),
             ]
             .contains(&id)
-    }
-}
-
-fn set_text(item: &MenuItem, text: String) {
-    if item.text() != text {
-        item.set_text(text);
     }
 }
 
@@ -393,10 +411,7 @@ fn update_menu(
         })
         .count();
     if *last_counts != Some((ready, pending, problems)) {
-        let summary = format!(
-            "{ready} Ready · {pending} In Progress · {problems} Need Attention · {} Saved",
-            statuses.len()
-        );
+        let summary = session_summary(statuses.len(), ready, pending, problems);
         panel.set_summary(&summary);
         tray.set_tooltip(Some(format!("SSMux — {summary}")))?;
         tray.set_icon_with_as_template(Some(icons[usize::from(ready > 0)].clone()), ready == 0)?;
@@ -414,27 +429,22 @@ fn update_menu(
                 status.retry_attempt,
             );
         }
-        let text = match status.state {
-            ConnectionState::Running => "Tunnel Ready",
-            ConnectionState::Connecting => "Connecting…",
-            ConnectionState::Reconnecting => "Waiting to Reconnect…",
-            ConnectionState::Stopping => "Stopping…",
-            ConnectionState::Stopped => "Not Connected",
-            ConnectionState::Disconnected => "Connection Interrupted",
-            ConnectionState::Failed => "Connection Failed",
-        };
-        set_text(&connection.status, text.into());
-        connection.edit.set_enabled(can_edit(status.state));
-        connection.delete.set_enabled(can_edit(status.state));
-        connection.sign_in.set_enabled(
-            !signing_in
-                && can_edit(status.state)
-                && (status.failure_kind == Some(FailureKind::SsoExpired)
-                    || aws
-                        .profiles
-                        .iter()
-                        .any(|p| p.name == effective_profile(saved) && p.sso)),
-        );
+        set_enabled(&connection.edit, can_edit(status.state));
+        set_enabled(&connection.delete, can_edit(status.state));
+        let offers_sign_in = status.failure_kind == Some(FailureKind::SsoExpired)
+            || aws
+                .profiles
+                .iter()
+                .any(|p| p.name == effective_profile(saved) && p.sso);
+        if offers_sign_in != connection.sign_in_visible {
+            if offers_sign_in {
+                connection.details.insert(&connection.sign_in, 6)?;
+            } else {
+                connection.details.remove(&connection.sign_in)?;
+            }
+            connection.sign_in_visible = offers_sign_in;
+        }
+        set_enabled(&connection.sign_in, !signing_in && can_edit(status.state));
     }
     Ok(())
 }
@@ -442,24 +452,8 @@ fn update_menu(
 fn build_connection(connection: &ConnectionConfig) -> Result<ConnectionMenu> {
     let action = MenuId::new(format!("connection:{}", connection.name));
     let recovery = MenuId::new(format!("recover:{}", connection.name));
-    let details = Submenu::new(connection_route(connection), true);
-    let status = MenuItem::new("Not Connected", false, None);
-    details.append(&MenuItem::new("Manage", false, None))?;
-    details.append(&status)?;
-    for text in [
-        format!(
-            "Destination: {}",
-            connection
-                .parameters
-                .get("host")
-                .unwrap_or(&connection.target)
-        ),
-        format!("SSM Target: {}", connection.target),
-        connection_identity(connection),
-    ] {
-        details.append(&MenuItem::new(text, false, None))?;
-    }
-    details.append(&PredefinedMenuItem::separator())?;
+    let details = Submenu::new("Session Actions", true);
+    details.append(&MenuItem::new("…", true, None))?;
     let copy = MenuItem::new(
         "Copy Local Address",
         local_address(connection).is_some(),
@@ -479,23 +473,18 @@ fn build_connection(connection: &ConnectionConfig) -> Result<ConnectionMenu> {
     let sign_in = MenuItem::new("Sign In to AWS SSO…", false, None);
     let edit = MenuItem::new("Edit Session…", true, None);
     let delete = MenuItem::new("Delete Session…", true, None);
-    for item in [
-        &copy,
-        &duplicate,
-        &pin,
-        &diagnostics,
-        &sign_in,
-        &edit,
-        &delete,
-    ] {
+    for item in [&edit, &duplicate, &pin] {
         details.append(item)?;
     }
+    details.append(&PredefinedMenuItem::separator())?;
+    details.append(&diagnostics)?;
+    details.append(&PredefinedMenuItem::separator())?;
+    details.append(&delete)?;
     Ok(ConnectionMenu {
         name: connection.name.clone(),
         action,
         recovery,
         details,
-        status,
         edit,
         delete,
         duplicate,
@@ -503,33 +492,12 @@ fn build_connection(connection: &ConnectionConfig) -> Result<ConnectionMenu> {
         pin,
         diagnostics,
         sign_in,
+        sign_in_visible: false,
         row: None,
     })
 }
 
-pub(crate) fn connection_route(connection: &ConnectionConfig) -> String {
-    let destination = connection
-        .parameters
-        .get("host")
-        .unwrap_or(&connection.target);
-    match (
-        connection.parameters.get("localPortNumber"),
-        connection.parameters.get("portNumber"),
-    ) {
-        (Some(local), Some(remote)) => format!("localhost:{local} → {destination}:{remote}"),
-        _ => format!("Target: {destination}"),
-    }
-}
-
-pub(crate) fn connection_identity(connection: &ConnectionConfig) -> String {
-    format!(
-        "Profile: {} · Region: {}",
-        connection.profile.as_deref().unwrap_or("AWS default"),
-        connection.region.as_deref().unwrap_or("AWS default")
-    )
-}
-
-fn local_address(connection: &ConnectionConfig) -> Option<String> {
+pub(crate) fn local_address(connection: &ConnectionConfig) -> Option<String> {
     connection
         .parameters
         .get("localPortNumber")
@@ -609,6 +577,7 @@ fn attach_rows(
     panel: &SessionPopover,
     config: &Config,
     connections: &mut [ConnectionMenu],
+    layout_id: &MenuId,
     proxy: &tao::event_loop::EventLoopProxy<MenuEvent>,
 ) -> Result<()> {
     for (connection, item) in config.connections.iter().zip(connections.iter_mut()) {
@@ -617,6 +586,8 @@ fn attach_rows(
             &item.details,
             item.action.clone(),
             item.recovery.clone(),
+            item.copy.id().clone(),
+            layout_id.clone(),
             proxy.clone(),
         )?);
     }
@@ -679,7 +650,19 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
-    fn route_and_identity_distinguish_destinations_and_copy_the_local_address() {
+    fn summary_omits_empty_states_without_hiding_pending_or_failed_sessions() {
+        assert_eq!(session_summary(0, 0, 0, 0), "0 Sessions");
+        assert_eq!(session_summary(1, 0, 0, 0), "1 Session");
+        assert_eq!(session_summary(3, 0, 0, 0), "3 Sessions");
+        assert_eq!(session_summary(3, 1, 0, 0), "3 Sessions · 1 Ready");
+        assert_eq!(
+            session_summary(3, 1, 1, 1),
+            "3 Sessions · 1 Ready · 1 Pending · 1 Issue"
+        );
+    }
+
+    #[test]
+    fn copy_uses_only_the_local_address_and_requires_a_local_port() {
         let connection = ConnectionConfig {
             name: "test".into(),
             target: "i-test".into(),
@@ -696,20 +679,11 @@ mod tests {
             ]),
         };
         assert_eq!(
-            connection_route(&connection),
-            "localhost:13308 → db.example.test:3306"
-        );
-        assert_eq!(
             local_address(&connection).as_deref(),
             Some("localhost:13308")
         );
-        assert_eq!(
-            connection_identity(&connection),
-            "Profile: AWS default · Region: AWS default"
-        );
         let mut custom = connection;
         custom.parameters.clear();
-        assert_eq!(connection_route(&custom), "Target: i-test");
         assert!(local_address(&custom).is_none());
     }
 
