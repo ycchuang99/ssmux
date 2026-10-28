@@ -33,6 +33,9 @@ jobs:
       - name: Check Homebrew updater
         run: python3 scripts/update-homebrew.py --self-test
 
+      - name: Check macOS release gates
+        run: python3 scripts/test-macos-release.py
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 

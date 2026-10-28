@@ -26,10 +26,24 @@ cat > "$bundle/Contents/Info.plist" <<PLIST
   <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>$version</string>
+  <key>CFBundleVersion</key><string>$version</string>
   <key>LSUIElement</key><true/>
 </dict>
 </plist>
 PLIST
 
 plutil -lint "$bundle/Contents/Info.plist"
-codesign --force --sign - "$bundle"
+if [ -n "${SSMUX_SIGNING_IDENTITY:-}" ]; then
+  case "$SSMUX_SIGNING_IDENTITY" in
+    "Developer ID Application: "*) ;;
+    *) echo "SSMUX_SIGNING_IDENTITY must be a Developer ID Application identity" >&2; exit 1 ;;
+  esac
+  set -- --force --options runtime --timestamp --sign "$SSMUX_SIGNING_IDENTITY"
+  if [ -n "${SSMUX_SIGNING_KEYCHAIN:-}" ]; then
+    set -- "$@" --keychain "$SSMUX_SIGNING_KEYCHAIN"
+  fi
+  codesign "$@" "$bundle"
+else
+  codesign --force --sign - "$bundle"
+fi
+codesign --verify --strict --verbose=2 "$bundle"

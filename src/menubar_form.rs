@@ -18,7 +18,10 @@ use objc2_foundation::{
     NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
 };
 
-use crate::config::{self, Config, ConnectionConfig};
+use crate::{
+    aws_settings::AwsSettings,
+    config::{self, Config, ConnectionConfig},
+};
 
 const INSTANCE_DOCUMENT: &str = "AWS-StartPortForwardingSession";
 const REMOTE_DOCUMENT: &str = "AWS-StartPortForwardingSessionToRemoteHost";
@@ -41,6 +44,10 @@ struct EditorState {
     labels: Vec<Retained<NSTextField>>,
     mode_label: Retained<NSTextField>,
     mode: Retained<NSPopUpButton>,
+    profiles: Retained<NSPopUpButton>,
+    setup: Retained<NSTextField>,
+    reconnect: Retained<NSButton>,
+    reconnect_hint: Retained<NSTextField>,
     advanced: Retained<NSButton>,
     parameters_label: Retained<NSTextField>,
     parameters_scroll: Retained<NSScrollView>,
@@ -51,6 +58,8 @@ struct EditorState {
     save: Retained<NSButton>,
     config: Config,
     existing: Option<ConnectionConfig>,
+    aws: AwsSettings,
+    suggested_region: RefCell<Option<String>>,
     attempted_save: Cell<bool>,
     result: RefCell<Option<ConnectionConfig>>,
 }
@@ -131,6 +140,21 @@ define_class!(
         }
         #[unsafe(method(toggleAdvanced:))]
         fn toggle_advanced(&self, _sender: &NSObject) { self.layout(); }
+        #[unsafe(method(selectProfile:))]
+        fn select_profile(&self, _sender: &NSObject) {
+            let state = self.ivars();
+            let Some(selected) = state.profiles.titleOfSelectedItem() else { return; };
+            let Some(profile) = state.aws.profiles.iter().find(|profile| profile.name == selected.to_string()) else { return; };
+            state.fields[3].setStringValue(&NSString::from_str(&profile.name));
+            let current = state.fields[2].stringValue().to_string();
+            let suggested = state.suggested_region.borrow();
+            if should_fill_region(&current, suggested.as_deref()) {
+                state.fields[2].setStringValue(&NSString::from_str(profile.region.as_deref().unwrap_or("")));
+                drop(suggested);
+                state.suggested_region.replace(profile.region.clone());
+            }
+            self.refresh_validation();
+        }
     }
 );
 
@@ -142,12 +166,14 @@ impl SessionEditor {
             .iter()
             .map(|field| field.stringValue().to_string())
             .collect::<Vec<_>>();
-        connection_from_fields(
+        let mut connection = connection_from_fields(
             &state.config,
             state.existing.as_ref(),
             &values,
             &state.parameters.string().to_string(),
-        )
+        )?;
+        connection.auto_reconnect = state.reconnect.state() == 1;
+        Ok(connection)
     }
 
     fn refresh_validation(&self) {
@@ -166,14 +192,17 @@ impl SessionEditor {
         };
         let route = format!("localhost:{local}  →  {destination}:{remote}");
         state.route.setStringValue(&NSString::from_str(&route));
-        if state.attempted_save.get() {
-            let error = self
-                .connection()
+        let warning =
+            local_port_warning(&state.config, state.existing.as_ref(), &local.to_string());
+        let message = if state.attempted_save.get() {
+            self.connection()
                 .err()
                 .map(|error| error.to_string())
-                .unwrap_or_default();
-            state.error.setStringValue(&NSString::from_str(&error));
-        }
+                .unwrap_or(warning)
+        } else {
+            warning
+        };
+        state.error.setStringValue(&NSString::from_str(&message));
     }
 
     fn layout(&self) {
@@ -187,7 +216,10 @@ impl SessionEditor {
             .setFrame(rect(24., size.height - 85., width, 22.));
         state
             .scroll
-            .setFrame(rect(16., 108., size.width - 32., size.height - 208.));
+            .setFrame(rect(16., 108., size.width - 32., size.height - 272.));
+        state
+            .setup
+            .setFrame(rect(24., size.height - 149., width, 56.));
         state.error.setFrame(rect(24., 56., width, 44.));
         state
             .cancel
@@ -237,6 +269,11 @@ impl SessionEditor {
             place(3, 24. + half, y, half);
             y += 68.;
         }
+        state.profiles.setFrame(rect(5., y, width + 6., 32.));
+        y += 44.;
+        state.reconnect.setFrame(rect(8., y, width, 28.));
+        state.reconnect_hint.setFrame(rect(8., y + 30., width, 36.));
+        y += 76.;
         state.advanced.setFrame(rect(8., y, width, 32.));
         y += 44.;
         let advanced = state.advanced.state() == 1 || state.mode.indexOfSelectedItem() == 2;
@@ -266,6 +303,34 @@ impl SessionEditor {
 pub fn edit_connection(
     config: &Config,
     existing: Option<&ConnectionConfig>,
+    aws: &AwsSettings,
+) -> Result<Option<ConnectionConfig>> {
+    edit_form(
+        config,
+        existing,
+        aws,
+        if existing.is_some() {
+            "Edit Session"
+        } else {
+            "New Session"
+        },
+    )
+}
+
+pub fn duplicate_connection(
+    config: &Config,
+    source: &ConnectionConfig,
+    aws: &AwsSettings,
+) -> Result<Option<ConnectionConfig>> {
+    let copy = duplicate_draft(config, source);
+    edit_form(config, Some(&copy), aws, "Duplicate Session")
+}
+
+fn edit_form(
+    config: &Config,
+    existing: Option<&ConnectionConfig>,
+    aws: &AwsSettings,
+    title: &str,
 ) -> Result<Option<ConnectionConfig>> {
     let mtm = MainThreadMarker::new().context("session form requires the main thread")?;
     let panel = NSPanel::initWithContentRect_styleMask_backing_defer(
@@ -280,11 +345,6 @@ pub fn edit_connection(
     }
     panel.setHidesOnDeactivate(false);
     panel.setContentMinSize(NSSize::new(520., 520.));
-    let title = if existing.is_some() {
-        "Edit Session"
-    } else {
-        "New Session"
-    };
     panel.setTitle(&NSString::from_str(title));
     let content = panel.contentView().context("creating editor content")?;
     let heading = label(title, 20., mtm);
@@ -295,6 +355,11 @@ pub fn edit_connection(
     let route = label("localhost → destination", 13., mtm);
     route.setFont(NSFont::userFixedPitchFontOfSize(13.).as_deref());
     content.addSubview(&route);
+    let setup = NSTextField::wrappingLabelWithString(&NSString::from_str(&aws.summary()), mtm);
+    setup.setFont(Some(&NSFont::systemFontOfSize(12.)));
+    setup.setTextColor(Some(&NSColor::secondaryLabelColor()));
+    setup.setAccessibilityLabel(Some(&NSString::from_str("Local AWS Setup")));
+    content.addSubview(&setup);
     let scroll = NSScrollView::new(mtm);
     scroll.setHasVerticalScroller(true);
     scroll.setAutohidesScrollers(true);
@@ -327,6 +392,35 @@ pub fn edit_connection(
         labels.push(caption);
         fields.push(field);
     }
+    let profiles = NSPopUpButton::new(mtm);
+    profiles.addItemWithTitle(&NSString::from_str("Choose Existing AWS Profile…"));
+    for profile in &aws.profiles {
+        profiles.addItemWithTitle(&NSString::from_str(&profile.name));
+    }
+    if aws.profiles.iter().any(|profile| profile.name == values[3]) {
+        profiles.selectItemWithTitle(&NSString::from_str(&values[3]));
+    }
+    profiles.setEnabled(!aws.profiles.is_empty());
+    profiles.setAccessibilityLabel(Some(&NSString::from_str("Choose Existing AWS Profile")));
+    document.addSubview(&profiles);
+    let reconnect = NSButton::new(mtm);
+    reconnect.setButtonType(NSButtonType::Switch);
+    reconnect.setTitle(&NSString::from_str(
+        "Reconnect After an Unexpected Disconnect",
+    ));
+    reconnect.setState(isize::from(
+        existing.is_some_and(|item| item.auto_reconnect),
+    ));
+    reconnect.setAccessibilityLabel(Some(&NSString::from_str(
+        "Reconnect After an Unexpected Disconnect",
+    )));
+    document.addSubview(&reconnect);
+    let reconnect_hint = NSTextField::wrappingLabelWithString(
+        &NSString::from_str("Limited retries while SSMux is open. Stopping a session cancels retries; quitting stops all sessions."), mtm,
+    );
+    reconnect_hint.setFont(Some(&NSFont::systemFontOfSize(12.)));
+    reconnect_hint.setTextColor(Some(&NSColor::secondaryLabelColor()));
+    document.addSubview(&reconnect_hint);
     let mode_label = label("Forward To", 13., mtm);
     let mode = NSPopUpButton::new(mtm);
     for title in ["Remote Host", "SSM Instance", "Custom Document"] {
@@ -387,6 +481,10 @@ pub fn edit_connection(
         labels,
         mode_label,
         mode,
+        profiles,
+        setup,
+        reconnect,
+        reconnect_hint,
         advanced,
         parameters_label,
         parameters_scroll,
@@ -397,6 +495,8 @@ pub fn edit_connection(
         save,
         config: config.clone(),
         existing: existing.cloned(),
+        aws: aws.clone(),
+        suggested_region: RefCell::new(None),
         attempted_save: Cell::new(false),
         result: RefCell::new(None),
     });
@@ -411,13 +511,15 @@ pub fn edit_connection(
         state.mode.setAction(Some(sel!(changeMode:)));
         state.advanced.setTarget(Some(&editor));
         state.advanced.setAction(Some(sel!(toggleAdvanced:)));
+        state.profiles.setTarget(Some(&editor));
+        state.profiles.setAction(Some(sel!(selectProfile:)));
         for field in &state.fields {
             field.setDelegate(Some(ProtocolObject::from_ref(&*editor)));
         }
         state
             .parameters
             .setDelegate(Some(ProtocolObject::from_ref(&*editor)));
-        let order: [&NSView; 13] = [
+        let order: [&NSView; 15] = [
             &state.fields[0],
             &state.mode,
             &state.fields[5],
@@ -426,6 +528,8 @@ pub fn edit_connection(
             &state.fields[1],
             &state.fields[2],
             &state.fields[3],
+            &state.profiles,
+            &state.reconnect,
             &state.advanced,
             &state.fields[4],
             &state.parameters,
@@ -462,6 +566,39 @@ fn label(text: &str, size: f64, mtm: MainThreadMarker) -> Retained<NSTextField> 
     label.setFont(Some(&NSFont::systemFontOfSize(size)));
     label.setTextColor(Some(&NSColor::labelColor()));
     label
+}
+
+fn should_fill_region(current: &str, previous_suggestion: Option<&str>) -> bool {
+    current.trim().is_empty() || previous_suggestion == Some(current)
+}
+
+fn duplicate_draft(config: &Config, source: &ConnectionConfig) -> ConnectionConfig {
+    let mut copy = source.clone();
+    copy.name = format!("{} Copy", source.name);
+    let mut number = 2;
+    while config.connections.iter().any(|item| item.name == copy.name) {
+        copy.name = format!("{} Copy {number}", source.name);
+        number += 1;
+    }
+    copy.parameters.remove("localPortNumber");
+    copy.auto_reconnect = false;
+    copy.pinned = false;
+    copy
+}
+
+fn local_port_warning(config: &Config, existing: Option<&ConnectionConfig>, port: &str) -> String {
+    let Ok(port) = port.trim().parse::<u16>() else {
+        return String::new();
+    };
+    let conflict = config.connections.iter().find(|item| {
+        existing.is_none_or(|current| current.name != item.name)
+            && item
+                .parameters
+                .get("localPortNumber")
+                .and_then(|value| value.parse::<u16>().ok())
+                == Some(port)
+    });
+    conflict.map(|item| format!("Local port {port} is also used by “{}”. These sessions cannot run together; choose a different port to use both.", item.name)).unwrap_or_default()
 }
 
 fn editor_values(existing: Option<&ConnectionConfig>) -> ([String; 8], String) {
@@ -558,6 +695,8 @@ fn connection_from_fields(
         extra_args: existing
             .map(|item| item.extra_args.clone())
             .unwrap_or_default(),
+        auto_reconnect: existing.is_some_and(|item| item.auto_reconnect),
+        pinned: existing.is_some_and(|item| item.pinned),
     };
     if crate::ssm::is_interactive(&connection) {
         anyhow::bail!("Choose a forwarding document. Interactive shells require a terminal.");
@@ -623,6 +762,8 @@ mod tests {
         let mut connection =
             connection_from_fields(&Config::default(), None, &remote(), "custom=value").unwrap();
         connection.extra_args = vec!["--endpoint-url".into(), "https://example.test".into()];
+        connection.auto_reconnect = true;
+        connection.pinned = true;
         let config = Config {
             connections: vec![connection.clone()],
         };
@@ -677,5 +818,41 @@ mod tests {
         );
         fields[4] = "".into();
         assert!(connection_from_fields(&Config::default(), None, &fields, "").is_err());
+    }
+
+    #[test]
+    fn profile_selection_preserves_explicit_regions() {
+        assert!(should_fill_region("", None));
+        assert!(should_fill_region("us-west-2", Some("us-west-2")));
+        assert!(!should_fill_region("us-east-1", Some("us-west-2")));
+        assert!(!should_fill_region("us-east-1", None));
+    }
+
+    #[test]
+    fn duplicating_requires_a_new_local_port_and_preserves_advanced_arguments() {
+        let mut source =
+            connection_from_fields(&Config::default(), None, &remote(), "custom=value").unwrap();
+        source.extra_args = vec!["--endpoint-url".into(), "https://example.test".into()];
+        source.auto_reconnect = true;
+        source.pinned = true;
+        let mut config = Config {
+            connections: vec![source.clone()],
+        };
+        let first = duplicate_draft(&config, &source);
+        config.connections.push(first.clone());
+        let copy = duplicate_draft(&config, &source);
+        assert_eq!(copy.name, "demo Copy 2");
+        assert_eq!(copy.extra_args, source.extra_args);
+        assert_eq!(copy.parameters["custom"], "value");
+        assert!(!copy.auto_reconnect);
+        assert!(!copy.pinned);
+        let (mut fields, parameters) = editor_values(Some(&copy));
+        assert!(connection_from_fields(&config, Some(&copy), &fields, &parameters).is_err());
+        fields[7] = "13309".into();
+        let saved = connection_from_fields(&config, Some(&copy), &fields, &parameters).unwrap();
+        assert_eq!(saved.extra_args, source.extra_args);
+        assert!(local_port_warning(&config, Some(&copy), "13308").contains("demo"));
+        assert!(local_port_warning(&config, Some(&copy), "13309").is_empty());
+        assert!(local_port_warning(&config, Some(&source), "13308").is_empty());
     }
 }

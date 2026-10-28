@@ -24,6 +24,10 @@ pub struct ConnectionConfig {
     pub parameters: BTreeMap<String, String>,
     #[serde(default)]
     pub extra_args: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub auto_reconnect: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pinned: bool,
 }
 
 impl Config {
@@ -117,4 +121,26 @@ pub fn parse_parameters(values: &[String]) -> Result<BTreeMap<String, String>> {
         }
     }
     Ok(parameters)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn old_configs_default_to_manual_connections_and_new_preferences_round_trip() {
+        let mut config: Config = toml::from_str(
+            r#"[[connections]]
+name = "Existing"
+target = "i-test"
+"#,
+        )
+        .unwrap();
+        assert!(!config.connections[0].auto_reconnect);
+        assert!(!config.connections[0].pinned);
+        config.connections[0].auto_reconnect = true;
+        config.connections[0].pinned = true;
+        let loaded: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        assert_eq!(loaded.connections, config.connections);
+    }
 }

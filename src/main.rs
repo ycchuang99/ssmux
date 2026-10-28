@@ -1,3 +1,5 @@
+#[cfg(target_os = "macos")]
+mod aws_settings;
 mod cli;
 mod config;
 #[cfg(target_os = "macos")]
@@ -81,6 +83,8 @@ fn config_command(config_path: &Path, command: ConfigCommand) -> Result<()> {
                 document_name,
                 parameters: config::parse_parameters(&parameters)?,
                 extra_args: Vec::new(),
+                auto_reconnect: false,
+                pinned: false,
             };
             if config
                 .connections

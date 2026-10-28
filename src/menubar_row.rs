@@ -1,4 +1,7 @@
-use crate::{config::ConnectionConfig, session::ConnectionState};
+use crate::{
+    config::ConnectionConfig,
+    session::{ConnectionState, FailureKind},
+};
 use anyhow::{Context, Result};
 use objc2::{
     class, define_class, msg_send, rc::Retained, sel, DefinedClass, MainThreadMarker,
@@ -21,6 +24,10 @@ pub struct RowState {
     view: Retained<NSView>,
     button: Retained<NSButton>,
     action: MenuId,
+    recovery_action: MenuId,
+    recovery: Retained<NSButton>,
+    status: Retained<NSTextField>,
+    hint: Retained<NSTextField>,
     proxy: EventLoopProxy<MenuEvent>,
     name: String,
     interactive: bool,
@@ -33,6 +40,11 @@ define_class!(
     pub struct ConnectionRow;
     unsafe impl NSObjectProtocol for ConnectionRow {}
     impl ConnectionRow {
+        #[unsafe(method(recoverSession:))]
+        fn recover_session(&self, _sender: &NSButton) {
+            let state = self.ivars();
+            let _ = state.proxy.send_event(MenuEvent { id: state.recovery_action.clone() });
+        }
         #[unsafe(method(toggleSession:))]
         fn toggle_session(&self, _sender: &NSButton) {
             let state = self.ivars();
@@ -46,31 +58,67 @@ impl ConnectionRow {
         connection: &ConnectionConfig,
         details: &Submenu,
         action: MenuId,
+        recovery_action: MenuId,
         proxy: EventLoopProxy<MenuEvent>,
     ) -> Result<Retained<Self>> {
         let mtm = MainThreadMarker::new().context("menu rows require the main thread")?;
-        let view = NSView::initWithFrame(NSView::alloc(mtm), rect(0., 0., 420., 60.));
-        let name = label(&connection.name, rect(56., 31., 252., 20.), mtm);
+        let view = NSView::initWithFrame(
+            NSView::alloc(mtm),
+            rect(
+                0.,
+                0.,
+                crate::menubar_popover::WIDTH,
+                crate::menubar_popover::ROW_HEIGHT,
+            ),
+        );
+        let title = if connection.pinned {
+            format!("★ {}", connection.name)
+        } else {
+            connection.name.clone()
+        };
+        let name = label(&title, rect(56., 90., 380., 20.), mtm);
         name.setFont(Some(&NSFont::boldSystemFontOfSize(13.)));
         name.setToolTip(Some(&NSString::from_str(&connection.name)));
         view.addSubview(&name);
         let route = label(
             &crate::menubar::connection_route(connection),
-            rect(56., 9., 252., 20.),
+            rect(56., 70., 490., 20.),
             mtm,
         );
         route.setTextColor(Some(&NSColor::secondaryLabelColor()));
+        route.setToolTip(Some(&NSString::from_str(
+            &crate::menubar::connection_route(connection),
+        )));
         view.addSubview(&route);
+        let identity = crate::menubar::connection_identity(connection);
+        let profile = label(&identity, rect(56., 50., 490., 18.), mtm);
+        profile.setFont(Some(&NSFont::systemFontOfSize(12.)));
+        profile.setTextColor(Some(&NSColor::secondaryLabelColor()));
+        profile.setToolTip(Some(&NSString::from_str(&identity)));
+        view.addSubview(&profile);
+        let status = label("Not Connected", rect(56., 28., 380., 20.), mtm);
+        let hint = label("", rect(56., 8., 380., 18.), mtm);
+        hint.setFont(Some(&NSFont::systemFontOfSize(12.)));
+        hint.setTextColor(Some(&NSColor::secondaryLabelColor()));
+        view.addSubview(&status);
+        view.addSubview(&hint);
+        let recovery = NSButton::new(mtm);
+        recovery.setFrame(rect(448., 12., 100., 28.));
+        recovery.setBezelStyle(NSBezelStyle::Push);
+        recovery.setHidden(true);
+        view.addSubview(&recovery);
         let button = NSButton::new(mtm);
-        button.setFrame(rect(10., 12., 36., 36.));
-        button.setBordered(false);
+        button.setFrame(rect(10., 66., 36., 36.));
+        button.setBordered(true);
+        button.setBezelStyle(NSBezelStyle::Circular);
+        button.setShowsBorderOnlyWhileMouseInside(true);
         button.setTitle(&NSString::from_str(""));
         button.setImagePosition(NSCellImagePosition::ImageOnly);
         button.setWantsLayer(true);
         view.addSubview(&button);
         let more = NSPopUpButton::initWithFrame_pullsDown(
             NSPopUpButton::alloc(mtm),
-            rect(320., 16., 88., 28.),
+            rect(448., 82., 100., 28.),
             true,
         );
         more.setBezelStyle(NSBezelStyle::Push);
@@ -82,23 +130,29 @@ impl ConnectionRow {
             connection.name
         ))));
         more.setToolTip(Some(&NSString::from_str(
-            "Session details, edit, and delete",
+            "Session details, copy, pin, edit, and delete",
         )));
         view.addSubview(&more);
         let row = Self::alloc(mtm).set_ivars(RowState {
             view,
             button,
             action,
+            recovery_action,
+            recovery,
+            status,
+            hint,
             proxy,
             name: connection.name.clone(),
             interactive: crate::ssm::is_interactive(connection),
         });
         let row: Retained<Self> = unsafe { msg_send![super(row), init] };
         unsafe {
+            row.ivars().recovery.setTarget(Some(&row));
+            row.ivars().recovery.setAction(Some(sel!(recoverSession:)));
             row.ivars().button.setTarget(Some(&row));
             row.ivars().button.setAction(Some(sel!(toggleSession:)));
         }
-        row.update(ConnectionState::Stopped, None);
+        row.update(ConnectionState::Stopped, None, None, 0);
         Ok(row)
     }
 
@@ -106,14 +160,36 @@ impl ConnectionRow {
         &self.ivars().view
     }
 
-    pub fn update(&self, state: ConnectionState, error: Option<&str>) {
+    pub fn update(
+        &self,
+        state: ConnectionState,
+        error: Option<&str>,
+        failure: Option<FailureKind>,
+        retry_attempt: u8,
+    ) {
         let row = self.ivars();
         let (symbol, action, status, color) = match state {
             ConnectionState::Running => (
                 "arrow.left.arrow.right.circle.fill",
                 "Disconnect",
-                "Running",
+                "Tunnel Ready",
                 NSColor::systemGreenColor(),
+            ),
+            ConnectionState::Connecting | ConnectionState::Reconnecting => (
+                "hourglass.circle.fill",
+                "Cancel",
+                if state == ConnectionState::Reconnecting {
+                    "Waiting to Reconnect…"
+                } else {
+                    "Connecting…"
+                },
+                NSColor::systemOrangeColor(),
+            ),
+            ConnectionState::Disconnected => (
+                "exclamationmark.arrow.circlepath",
+                "Reconnect",
+                "Connection Interrupted",
+                NSColor::systemOrangeColor(),
             ),
             ConnectionState::Stopping => (
                 "hourglass.circle.fill",
@@ -124,7 +200,7 @@ impl ConnectionRow {
             ConnectionState::Stopped => (
                 "arrow.left.arrow.right.circle.fill",
                 "Connect",
-                "Disconnected",
+                "Not Connected",
                 NSColor::systemGrayColor(),
             ),
             ConnectionState::Failed => (
@@ -134,6 +210,49 @@ impl ConnectionRow {
                 NSColor::systemRedColor(),
             ),
         };
+        let problem = matches!(
+            state,
+            ConnectionState::Failed | ConnectionState::Disconnected
+        );
+        let status_text = if problem {
+            failure.map(|kind| kind.summary()).unwrap_or(status)
+        } else {
+            status
+        };
+        row.status.setStringValue(&NSString::from_str(status_text));
+        row.status
+            .setToolTip(Some(&NSString::from_str(error.unwrap_or(status_text))));
+        let hint = if row.interactive {
+            "Choose a port-forwarding document in Edit Session.".to_owned()
+        } else if problem {
+            failure
+                .map(|kind| kind.suggestion().to_owned())
+                .unwrap_or_else(|| "Open Details for the diagnostic output.".to_owned())
+        } else if state == ConnectionState::Running {
+            "Remote service availability is not verified.".to_owned()
+        } else if state == ConnectionState::Reconnecting {
+            format!("Retry {retry_attempt} of 3 · Click Cancel to stop.")
+        } else if state == ConnectionState::Connecting {
+            "Waiting for the Session Manager tunnel.".to_owned()
+        } else {
+            String::new()
+        };
+        row.hint.setStringValue(&NSString::from_str(&hint));
+        row.hint.setToolTip(Some(&NSString::from_str(&hint)));
+        let recovery_title = match failure {
+            Some(FailureKind::SsoExpired) => "Sign In…",
+            Some(FailureKind::PortInUse) => "Change Port…",
+            Some(FailureKind::MissingDependency) => "Check Setup",
+            Some(FailureKind::Network | FailureKind::Timeout) => "Reconnect",
+            _ => "Details…",
+        };
+        row.recovery.setTitle(&NSString::from_str(recovery_title));
+        row.recovery.setHidden(!problem);
+        row.recovery
+            .setAccessibilityLabel(Some(&NSString::from_str(&format!(
+                "{recovery_title} {}",
+                row.name
+            ))));
         let description = if row.interactive {
             "Edit to choose a forwarding document"
         } else {
