@@ -11,13 +11,12 @@ use objc2::{
 };
 use objc2_app_kit::{
     NSAccessibility, NSBezelStyle, NSBox, NSBoxType, NSButton, NSCellImagePosition, NSColor,
-    NSControlSize, NSFont, NSImage, NSImageSymbolConfiguration, NSMenu, NSPopUpArrowPosition,
-    NSPopUpButton, NSPopUpButtonCell, NSProgressIndicator, NSProgressIndicatorStyle, NSTextField,
-    NSTitlePosition, NSView, NSWorkspace,
+    NSControlSize, NSFont, NSImage, NSImageSymbolConfiguration, NSProgressIndicator,
+    NSProgressIndicatorStyle, NSTextField, NSTitlePosition, NSView, NSWorkspace,
 };
 use objc2_foundation::{NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString};
 use tao::event_loop::EventLoopProxy;
-use tray_icon::menu::{ContextMenu, MenuEvent, MenuId, Submenu};
+use tray_icon::menu::{MenuEvent, MenuId, Submenu};
 
 pub struct RowState {
     view: Retained<NSView>,
@@ -27,6 +26,7 @@ pub struct RowState {
     expanded: Cell<bool>,
     button: Retained<NSButton>,
     action: MenuId,
+    actions: Submenu,
     recovery_action: MenuId,
     copy_action: MenuId,
     layout_action: MenuId,
@@ -67,6 +67,10 @@ define_class!(
         #[unsafe(method(copyAddress:))]
         fn copy_address(&self, _sender: &NSButton) {
             self.send(self.ivars().copy_action.clone());
+        }
+        #[unsafe(method(showActions:))]
+        fn show_actions(&self, sender: &NSButton) {
+            crate::menubar_popover::show_action_menu(&self.ivars().actions, sender);
         }
         #[unsafe(method(toggleDetails:))]
         fn toggle_details(&self, _sender: &NSButton) {
@@ -154,22 +158,11 @@ impl ConnectionRow {
         let disclosure = icon_button("chevron.right", "Show Session Details", mtm);
         disclosure.setFrame(rect(8., 34., 28., 28.));
         header.addSubview(&disclosure);
-        let more = NSPopUpButton::initWithFrame_pullsDown(
-            NSPopUpButton::alloc(mtm),
-            rect(WIDTH - 36., 38., 24., 24.),
-            true,
-        );
+        let more = NSButton::new(mtm);
+        more.setFrame(rect(WIDTH - 36., 38., 24., 24.));
         more.setBezelStyle(NSBezelStyle::Push);
         more.setControlSize(NSControlSize::Small);
         more.setFont(Some(&NSFont::systemFontOfSize(12.)));
-        unsafe {
-            more.setMenu(Some(&*actions.ns_menu().cast::<NSMenu>()));
-        }
-        if let Some(cell) = more.cell() {
-            if let Some(cell) = cell.downcast_ref::<NSPopUpButtonCell>() {
-                cell.setArrowPosition(NSPopUpArrowPosition::NoArrow);
-            }
-        }
         more.setTitle(&NSString::from_str("…"));
         more.setAccessibilityLabel(Some(&NSString::from_str(&format!(
             "Actions for {}",
@@ -191,6 +184,7 @@ impl ConnectionRow {
             expanded: Cell::new(false),
             button,
             action,
+            actions: actions.clone(),
             recovery_action,
             copy_action,
             layout_action,
@@ -214,6 +208,8 @@ impl ConnectionRow {
             row.ivars().disclosure.setAction(Some(sel!(toggleDetails:)));
             copy.setTarget(Some(&row));
             copy.setAction(Some(sel!(copyAddress:)));
+            more.setTarget(Some(&row));
+            more.setAction(Some(sel!(showActions:)));
         }
         row.update_disclosure();
         row.update(ConnectionState::Stopped, None, None, 0);

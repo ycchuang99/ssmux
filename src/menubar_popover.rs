@@ -6,9 +6,8 @@ use objc2::{
 };
 use objc2_app_kit::{
     NSAccessibility, NSAnimationContext, NSApplication, NSBezelStyle, NSBox, NSBoxType, NSButton,
-    NSColor, NSControlSize, NSFont, NSImage, NSMenu, NSPopUpArrowPosition, NSPopUpButton,
-    NSPopUpButtonCell, NSPopover, NSPopoverBehavior, NSScrollView, NSSearchField, NSTextAlignment,
-    NSTextField, NSView, NSViewController, NSWorkspace,
+    NSColor, NSControlSize, NSFont, NSImage, NSMenu, NSPopover, NSPopoverBehavior, NSScrollView,
+    NSSearchField, NSTextAlignment, NSTextField, NSView, NSViewController, NSWorkspace,
 };
 use objc2_foundation::{NSObject, NSObjectProtocol, NSPoint, NSRect, NSRectEdge, NSSize, NSString};
 use tao::event_loop::EventLoopProxy;
@@ -33,8 +32,8 @@ pub struct PopoverState {
     add: Retained<NSButton>,
     setup: Retained<NSButton>,
     setup_status: Retained<NSTextField>,
-    more: Retained<NSPopUpButton>,
-    _menu: Submenu,
+    more: Retained<NSButton>,
+    menu: Submenu,
     header_rule: Retained<NSBox>,
     footer_rule: Retained<NSBox>,
     proxy: EventLoopProxy<MenuEvent>,
@@ -56,6 +55,8 @@ define_class!(
         fn check_setup(&self, _sender: &NSButton) { self.send(self.ivars().setup_id.clone()); }
         #[unsafe(method(searchSessions:))]
         fn search_sessions(&self, _sender: &NSSearchField) { self.send(self.ivars().search_id.clone()); }
+        #[unsafe(method(showActions:))]
+        fn show_actions(&self, sender: &NSButton) { show_action_menu(&self.ivars().menu, sender); }
     }
 );
 
@@ -144,7 +145,6 @@ impl SessionPopover {
         )));
         content.addSubview(&setup);
         let menu = Submenu::new("SSMux", true);
-        menu.append(&MenuItem::new("…", true, None))?;
         menu.append(&MenuItem::with_id(
             setup_id.clone(),
             "Check AWS Setup…",
@@ -158,22 +158,11 @@ impl SessionPopover {
             true,
             None,
         ))?;
-        let more = NSPopUpButton::initWithFrame_pullsDown(
-            NSPopUpButton::alloc(mtm),
-            rect(0., 0., 28., 28.),
-            true,
-        );
+        let more = NSButton::new(mtm);
+        more.setTitle(&NSString::from_str("…"));
         more.setBezelStyle(NSBezelStyle::Push);
         more.setControlSize(NSControlSize::Small);
         more.setFont(Some(&NSFont::systemFontOfSize(12.)));
-        unsafe {
-            more.setMenu(Some(&*menu.ns_menu().cast::<NSMenu>()));
-        }
-        if let Some(cell) = more.cell() {
-            if let Some(cell) = cell.downcast_ref::<NSPopUpButtonCell>() {
-                cell.setArrowPosition(NSPopUpArrowPosition::NoArrow);
-            }
-        }
         more.setAccessibilityLabel(Some(&NSString::from_str("SSMux Actions")));
         more.setToolTip(Some(&NSString::from_str("Check setup or quit SSMux")));
         content.addSubview(&more);
@@ -201,7 +190,7 @@ impl SessionPopover {
             setup,
             setup_status,
             more,
-            _menu: menu,
+            menu,
             header_rule,
             footer_rule,
             proxy,
@@ -217,6 +206,8 @@ impl SessionPopover {
             this.ivars().setup.setAction(Some(sel!(checkSetup:)));
             this.ivars().search.setTarget(Some(&this));
             this.ivars().search.setAction(Some(sel!(searchSessions:)));
+            this.ivars().more.setTarget(Some(&this));
+            this.ivars().more.setAction(Some(sel!(showActions:)));
         }
         Ok(this)
     }
@@ -435,6 +426,12 @@ impl SessionPopover {
     pub fn is_shown(&self) -> bool {
         self.ivars().popover.isShown()
     }
+}
+
+pub(crate) fn show_action_menu(actions: &Submenu, button: &NSButton) {
+    // Open the menu on button activation so the press is handled only once.
+    let menu = unsafe { &*actions.ns_menu().cast::<NSMenu>() };
+    menu.popUpMenuPositioningItem_atLocation_inView(None, NSPoint::new(0., 0.), Some(button));
 }
 
 fn anchored_offset(previous: &[(usize, f64)], next: &[(usize, f64)], top: f64) -> f64 {

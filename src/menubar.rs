@@ -438,7 +438,7 @@ fn update_menu(
                 .any(|p| p.name == effective_profile(saved) && p.sso);
         if offers_sign_in != connection.sign_in_visible {
             if offers_sign_in {
-                connection.details.insert(&connection.sign_in, 6)?;
+                connection.details.insert(&connection.sign_in, 5)?;
             } else {
                 connection.details.remove(&connection.sign_in)?;
             }
@@ -453,7 +453,6 @@ fn build_connection(connection: &ConnectionConfig) -> Result<ConnectionMenu> {
     let action = MenuId::new(format!("connection:{}", connection.name));
     let recovery = MenuId::new(format!("recover:{}", connection.name));
     let details = Submenu::new("Session Actions", true);
-    details.append(&MenuItem::new("…", true, None))?;
     let copy = MenuItem::new(
         "Copy Local Address",
         local_address(connection).is_some(),
