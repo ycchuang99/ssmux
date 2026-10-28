@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, process::Stdio};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use tokio::process::{Child, Command};
 
 use crate::config::ConnectionConfig;
@@ -14,10 +14,17 @@ pub fn spawn_session(config: &ConnectionConfig) -> Result<Child> {
         .process_group(0)
         .kill_on_drop(true)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
-        .map_err(Into::into)
+        .context("could not start AWS CLI; check that it is installed and executable")
+}
+
+pub fn is_forwarding(config: &ConnectionConfig) -> bool {
+    matches!(
+        config.document_name.as_deref(),
+        Some("AWS-StartPortForwardingSession" | "AWS-StartPortForwardingSessionToRemoteHost")
+    )
 }
 
 pub fn is_interactive(config: &ConnectionConfig) -> bool {

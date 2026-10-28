@@ -28,7 +28,7 @@ libc = "0.2"
 tao = "0.37.1"
 tray-icon = { version = "0.25.1", default-features = false }
 objc2 = "0.6"
-objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSString", "NSGeometry", "NSNotification", "NSObject", "NSValue"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSString", "NSGeometry", "NSNotification", "NSObject", "NSValue", "NSDate"] }
 objc2-app-kit = { version = "0.3.2", default-features = false, features = [
     "std",
     "NSAlert",
@@ -39,8 +39,10 @@ objc2-app-kit = { version = "0.3.2", default-features = false, features = [
     "NSColorSpace",
     "NSAccessibilityProtocols",
     "NSAccessibility",
+    "NSAccessibilityConstants",
     "NSWorkspace",
     "NSControl",
+    "NSEvent",
     "NSFont",
     "NSFontDescriptor",
     "NSResponder",
@@ -52,6 +54,8 @@ objc2-app-kit = { version = "0.3.2", default-features = false, features = [
     "NSView",
     "NSWindow",
     "NSPanel",
+    "NSParagraphStyle",
+    "NSPasteboard",
     "NSPopover",
     "NSViewController",
     "NSStatusItem",

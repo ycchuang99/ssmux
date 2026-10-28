@@ -1,21 +1,27 @@
-use std::cell::{Cell, RefCell};
+use std::{
+    cell::{Cell, RefCell},
+    fmt,
+};
 
 use anyhow::{Context, Result};
 use objc2::{
     define_class, msg_send,
     rc::Retained,
-    runtime::{ProtocolObject, Sel},
+    runtime::{AnyObject, ProtocolObject, Sel},
     sel, DefinedClass, MainThreadMarker, MainThreadOnly,
 };
 use objc2_app_kit::{
-    NSAccessibility, NSAlert, NSAlertSecondButtonReturn, NSAlertStyle, NSApplication,
-    NSBackingStoreType, NSBezelStyle, NSButton, NSButtonType, NSColor,
-    NSControlTextEditingDelegate, NSFont, NSPanel, NSPopUpButton, NSScrollView, NSTextDelegate,
-    NSTextField, NSTextFieldBezelStyle, NSTextFieldDelegate, NSTextView, NSTextViewDelegate,
-    NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask,
+    NSAccessibility, NSAccessibilityAnnouncementKey,
+    NSAccessibilityAnnouncementRequestedNotification, NSAccessibilityPostNotificationWithUserInfo,
+    NSAlert, NSAlertSecondButtonReturn, NSAlertStyle, NSApplication, NSBackingStoreType,
+    NSBezelStyle, NSButton, NSButtonType, NSColor, NSControlTextEditingDelegate, NSEventMask,
+    NSFont, NSModalPanelRunLoopMode, NSModalResponseContinue, NSPanel, NSPopUpButton, NSScrollView,
+    NSTextDelegate, NSTextField, NSTextFieldBezelStyle, NSTextFieldDelegate, NSTextView,
+    NSTextViewDelegate, NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask,
 };
 use objc2_foundation::{
-    NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
+    NSDate, NSDictionary, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize,
+    NSString,
 };
 
 use crate::config::{self, Config, ConnectionConfig};
@@ -24,14 +30,41 @@ const INSTANCE_DOCUMENT: &str = "AWS-StartPortForwardingSession";
 const REMOTE_DOCUMENT: &str = "AWS-StartPortForwardingSessionToRemoteHost";
 const LABELS: [&str; 8] = [
     "Session Name",
-    "SSM Target",
-    "AWS Region",
-    "AWS Profile",
+    "SSM Target · Forwarding Node",
+    "AWS Region · Blank Uses AWS Default",
+    "AWS Profile · Blank Uses AWS Default",
     "SSM Document",
-    "Remote Host",
+    "Remote Host · Destination Reached by the Node",
     "Remote Port",
     "Local Port",
 ];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InputTarget {
+    Field(usize),
+    Parameters,
+}
+
+#[derive(Debug)]
+struct FieldError {
+    target: InputTarget,
+    message: String,
+}
+
+impl fmt::Display for FieldError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+impl std::error::Error for FieldError {}
+
+fn field_error(target: InputTarget, message: impl Into<String>) -> anyhow::Error {
+    FieldError {
+        target,
+        message: message.into(),
+    }
+    .into()
+}
 
 struct EditorState {
     panel: Retained<NSPanel>,
@@ -42,11 +75,17 @@ struct EditorState {
     mode_label: Retained<NSTextField>,
     mode: Retained<NSPopUpButton>,
     advanced: Retained<NSButton>,
+    advanced_label: Retained<NSTextField>,
     parameters_label: Retained<NSTextField>,
     parameters_scroll: Retained<NSScrollView>,
     parameters: Retained<NSTextView>,
     route: Retained<NSTextField>,
     error: Retained<NSTextField>,
+    field_error: Retained<NSTextField>,
+    validation_target: Cell<Option<InputTarget>>,
+    persistence_error: RefCell<String>,
+    previous_mode: Cell<isize>,
+    custom_document: RefCell<String>,
     cancel: Retained<NSButton>,
     save: Retained<NSButton>,
     config: Config,
@@ -111,7 +150,7 @@ define_class!(
                     self.ivars().result.replace(Some(connection));
                     NSApplication::sharedApplication(self.mtm()).stopModalWithCode(1);
                 }
-                Err(error) => self.ivars().error.setStringValue(&NSString::from_str(&error.to_string())),
+                Err(error) => self.display_validation(Some(&error), true),
             }
         }
         #[unsafe(method(cancelSession:))]
@@ -121,11 +160,18 @@ define_class!(
         #[unsafe(method(changeMode:))]
         fn change_mode(&self, _sender: &NSObject) {
             let state = self.ivars();
-            match state.mode.indexOfSelectedItem() {
-                0 => state.fields[4].setStringValue(&NSString::from_str(REMOTE_DOCUMENT)),
-                1 => state.fields[4].setStringValue(&NSString::from_str(INSTANCE_DOCUMENT)),
-                _ => state.advanced.setState(1),
+            if state.previous_mode.get() == 2 {
+                state.custom_document.replace(state.fields[4].stringValue().to_string());
             }
+            let mode = state.mode.indexOfSelectedItem();
+            let document = match mode {
+                0 => REMOTE_DOCUMENT.to_owned(),
+                1 => INSTANCE_DOCUMENT.to_owned(),
+                _ => state.custom_document.borrow().clone(),
+            };
+            state.fields[4].setStringValue(&NSString::from_str(&document));
+            state.previous_mode.set(mode);
+            if mode == 2 { state.advanced.setState(1); }
             self.refresh_validation();
             self.layout();
         }
@@ -150,29 +196,116 @@ impl SessionEditor {
         )
     }
 
+    fn announce_error(&self, message: &str) {
+        let message = NSString::from_str(message);
+        unsafe {
+            let info = NSDictionary::from_slices(
+                &[NSAccessibilityAnnouncementKey],
+                &[&*message as &AnyObject],
+            );
+            NSAccessibilityPostNotificationWithUserInfo(
+                &self.ivars().panel,
+                NSAccessibilityAnnouncementRequestedNotification,
+                Some(&info),
+            );
+        }
+    }
+
+    fn display_validation(&self, error: Option<&anyhow::Error>, focus: bool) {
+        let state = self.ivars();
+        let target = error
+            .and_then(|error| error.downcast_ref::<FieldError>())
+            .map(|error| error.target);
+        let message = error.map(|error| format!("{error:#}")).unwrap_or_default();
+        let previous_target = state.validation_target.replace(target);
+        let custom = state.mode.indexOfSelectedItem() == 2;
+        if matches!(
+            target,
+            Some(InputTarget::Field(4) | InputTarget::Parameters)
+        ) || (custom && matches!(target, Some(InputTarget::Field(5..=7))))
+        {
+            state.advanced.setState(1);
+        }
+        state
+            .field_error
+            .setStringValue(&NSString::from_str(if target.is_some() {
+                &message
+            } else {
+                ""
+            }));
+        let persistence = state.persistence_error.borrow();
+        let footer = if target.is_none() && error.is_some() {
+            &message
+        } else {
+            &persistence
+        };
+        state.error.setStringValue(&NSString::from_str(footer));
+        state.error.setToolTip(Some(&NSString::from_str(footer)));
+        for (index, field) in state.fields.iter().enumerate() {
+            let invalid = target == Some(InputTarget::Field(index));
+            let color = if invalid {
+                NSColor::systemRedColor()
+            } else {
+                NSColor::labelColor()
+            };
+            state.labels[index].setTextColor(Some(&color));
+            field.setAccessibilityHelp(invalid.then(|| NSString::from_str(&message)).as_deref());
+        }
+        state.parameters.setAccessibilityHelp(
+            (target == Some(InputTarget::Parameters))
+                .then(|| NSString::from_str(&message))
+                .as_deref(),
+        );
+        if previous_target != target || focus {
+            self.layout();
+        }
+        if focus {
+            match target {
+                Some(InputTarget::Field(index)) => {
+                    let top = state.fields[index].frame().origin.y - 23.;
+                    state.document.scrollRectToVisible(rect(
+                        8.,
+                        top,
+                        state.document.frame().size.width - 16.,
+                        state.field_error.frame().origin.y + 44. - top,
+                    ));
+                    state.panel.makeFirstResponder(Some(&state.fields[index]));
+                }
+                Some(InputTarget::Parameters) => {
+                    let top = state.parameters_label.frame().origin.y;
+                    state.document.scrollRectToVisible(rect(
+                        8.,
+                        top,
+                        state.document.frame().size.width - 16.,
+                        state.field_error.frame().origin.y + 44. - top,
+                    ));
+                    state.panel.makeFirstResponder(Some(&state.parameters));
+                }
+                None => {}
+            }
+            self.announce_error(&message);
+        }
+    }
+
     fn refresh_validation(&self) {
         let state = self.ivars();
-        let local = state.fields[7].stringValue();
-        let remote = state.fields[6].stringValue();
-        let destination = if state.mode.indexOfSelectedItem() == 1 {
-            state.fields[1].stringValue().to_string()
+        let route = if state.mode.indexOfSelectedItem() == 2 {
+            "Custom document · Parameters are passed as entered".to_owned()
         } else {
-            state.fields[5].stringValue().to_string()
+            let local = state.fields[7].stringValue();
+            let remote = state.fields[6].stringValue();
+            let destination = state.fields[if state.mode.indexOfSelectedItem() == 1 {
+                1
+            } else {
+                5
+            }]
+            .stringValue();
+            format!("localhost:{local}  →  {destination}:{remote}")
         };
-        let destination = if destination.is_empty() {
-            "destination"
-        } else {
-            &destination
-        };
-        let route = format!("localhost:{local}  →  {destination}:{remote}");
         state.route.setStringValue(&NSString::from_str(&route));
+        state.route.setToolTip(Some(&NSString::from_str(&route)));
         if state.attempted_save.get() {
-            let error = self
-                .connection()
-                .err()
-                .map(|error| error.to_string())
-                .unwrap_or_default();
-            state.error.setStringValue(&NSString::from_str(&error));
+            self.display_validation(self.connection().err().as_ref(), false);
         }
     }
 
@@ -180,93 +313,170 @@ impl SessionEditor {
         let state = self.ivars();
         let content = state.panel.contentView().expect("panel content view");
         let size = content.bounds().size;
-        let width = size.width - 48.;
         let compact = size.width < 600.;
+        let custom = state.mode.indexOfSelectedItem() == 2;
+        let advanced = state.advanced.state() == 1;
         state
             .route
-            .setFrame(rect(24., size.height - 85., width, 22.));
+            .setFrame(rect(24., size.height - 85., size.width - 48., 22.));
         state
             .scroll
             .setFrame(rect(16., 108., size.width - 32., size.height - 208.));
-        state.error.setFrame(rect(24., 56., width, 44.));
+        state.error.setFrame(rect(24., 56., size.width - 48., 44.));
         state
             .cancel
             .setFrame(rect(size.width - 226., 16., 92., 32.));
         state.save.setFrame(rect(size.width - 124., 16., 100., 32.));
         let width = state.scroll.contentSize().width - 16.;
-        let mut y = 8.;
+        for (index, (field, label)) in state.fields.iter().zip(&state.labels).enumerate() {
+            let visible = match index {
+                4 => custom || advanced,
+                5 => state.mode.indexOfSelectedItem() != 1 && (!custom || advanced),
+                6 | 7 => !custom || advanced,
+                _ => true,
+            };
+            field.setHidden(!visible);
+            label.setHidden(!visible);
+        }
+        state.parameters_label.setHidden(!custom && !advanced);
+        state.parameters_scroll.setHidden(!custom && !advanced);
+        state
+            .field_error
+            .setHidden(state.validation_target.get().is_none());
         let place = |index: usize, x: f64, y: f64, w: f64| {
             state.labels[index].setHidden(false);
             state.fields[index].setHidden(false);
             state.labels[index].setFrame(rect(x, y, w, 20.));
             state.fields[index].setFrame(rect(x, y + 23., w, 32.));
         };
-        place(0, 8., y, width);
-        y += 68.;
-        state.mode_label.setFrame(rect(8., y, width, 20.));
-        state.mode.setFrame(rect(5., y + 23., width + 6., 32.));
-        y += 68.;
-        let show_host = state.mode.indexOfSelectedItem() != 1;
-        state.labels[5].setHidden(!show_host);
-        state.fields[5].setHidden(!show_host);
-        if show_host {
-            place(5, 8., y, width);
-            y += 68.;
-        }
-        if compact {
-            place(6, 8., y, width);
-            y += 68.;
-            place(7, 8., y, width);
-            y += 68.;
-        } else {
-            let half = (width - 16.) / 2.;
-            place(6, 8., y, half);
-            place(7, 24. + half, y, half);
-            y += 68.;
-        }
-        place(1, 8., y, width);
-        y += 68.;
-        if compact {
-            place(2, 8., y, width);
-            y += 68.;
-            place(3, 8., y, width);
-            y += 68.;
-        } else {
-            let half = (width - 16.) / 2.;
-            place(2, 8., y, half);
-            place(3, 24. + half, y, half);
-            y += 68.;
-        }
-        state.advanced.setFrame(rect(8., y, width, 32.));
-        y += 44.;
-        let advanced = state.advanced.state() == 1 || state.mode.indexOfSelectedItem() == 2;
-        state.labels[4].setHidden(!advanced);
-        state.fields[4].setHidden(!advanced);
-        state.fields[4].setEnabled(state.mode.indexOfSelectedItem() == 2);
-        state.parameters_label.setHidden(!advanced);
-        state.parameters_scroll.setHidden(!advanced);
-        if advanced {
+        let advance = |y: f64, indices: &[usize]| {
+            if indices
+                .iter()
+                .any(|index| state.validation_target.get() == Some(InputTarget::Field(*index)))
+            {
+                state.field_error.setFrame(rect(8., y + 58., width, 44.));
+                y + 112.
+            } else {
+                y + 68.
+            }
+        };
+        let forwarding = |mut y: f64| {
+            if state.mode.indexOfSelectedItem() != 1 {
+                place(5, 8., y, width);
+                y = advance(y, &[5]);
+            }
+            if compact {
+                place(6, 8., y, width);
+                y = advance(y, &[6]);
+                place(7, 8., y, width);
+                advance(y, &[7])
+            } else {
+                let half = (width - 16.) / 2.;
+                place(6, 8., y, half);
+                place(7, 24. + half, y, half);
+                advance(y, &[6, 7])
+            }
+        };
+        let document_fields = |mut y: f64| {
             place(4, 8., y, width);
-            y += 68.;
+            y = advance(y, &[4]);
+            state.parameters_label.setHidden(false);
+            state.parameters_scroll.setHidden(false);
             state.parameters_label.setFrame(rect(8., y, width, 20.));
             state
                 .parameters_scroll
                 .setFrame(rect(8., y + 23., width, 112.));
-            y += 151.;
             state
                 .parameters
                 .setFrameSize(NSSize::new(width - 20., 112.));
+            y += 143.;
+            if state.validation_target.get() == Some(InputTarget::Parameters) {
+                state.field_error.setFrame(rect(8., y, width, 44.));
+                y += 48.;
+            }
+            y + 8.
+        };
+        let mut y = 8.;
+        place(0, 8., y, width);
+        y = advance(y, &[0]);
+        state.mode_label.setFrame(rect(8., y, width, 20.));
+        state.mode.setFrame(rect(5., y + 23., width + 6., 32.));
+        y += 68.;
+        y = if custom {
+            document_fields(y)
+        } else {
+            forwarding(y)
+        };
+        place(1, 8., y, width);
+        y = advance(y, &[1]);
+        if compact {
+            place(2, 8., y, width);
+            y = advance(y, &[2]);
+            place(3, 8., y, width);
+            y = advance(y, &[3]);
+        } else {
+            let half = (width - 16.) / 2.;
+            place(2, 8., y, half);
+            place(3, 24. + half, y, half);
+            y = advance(y, &[2, 3]);
         }
+        let advanced_title = if custom {
+            "Optional Forwarding Parameters"
+        } else {
+            "Advanced Settings"
+        };
+        state
+            .advanced_label
+            .setStringValue(&NSString::from_str(advanced_title));
+        state
+            .advanced
+            .setAccessibilityLabel(Some(&NSString::from_str(advanced_title)));
+        state.advanced.setFrame(rect(8., y, 28., 28.));
+        state
+            .advanced_label
+            .setFrame(rect(42., y + 4., width - 34., 20.));
+        y += 40.;
+        if advanced {
+            y = if custom {
+                forwarding(y)
+            } else {
+                document_fields(y)
+            };
+        }
+        state.fields[4].setEnabled(custom);
         state
             .document
             .setFrameSize(NSSize::new(state.scroll.contentSize().width, y));
+
+        let mut order: Vec<(&NSView, NSPoint)> = state
+            .fields
+            .iter()
+            .filter(|field| !field.isHidden() && field.isEnabled())
+            .map(|field| (&**field as &NSView, field.frame().origin))
+            .collect();
+        order.push((&state.mode, state.mode.frame().origin));
+        order.push((&state.advanced, state.advanced.frame().origin));
+        if !state.parameters_scroll.isHidden() {
+            order.push((&state.parameters, state.parameters_scroll.frame().origin));
+        }
+        order.sort_by(|a, b| a.1.y.total_cmp(&b.1.y).then(a.1.x.total_cmp(&b.1.x)));
+        let mut views = order.iter().map(|(view, _)| *view).collect::<Vec<_>>();
+        views.extend([&*state.cancel as &NSView, &*state.save as &NSView]);
+        unsafe {
+            for pair in views.windows(2) {
+                pair[0].setNextKeyView(Some(pair[1]));
+            }
+            state.save.setNextKeyView(views.first().copied());
+        }
     }
 }
 
 pub fn edit_connection(
     config: &Config,
     existing: Option<&ConnectionConfig>,
-) -> Result<Option<ConnectionConfig>> {
+    mut on_save: impl FnMut(ConnectionConfig) -> Result<()>,
+    mut on_tick: impl FnMut(),
+) -> Result<bool> {
     let mtm = MainThreadMarker::new().context("session form requires the main thread")?;
     let panel = NSPanel::initWithContentRect_styleMask_backing_defer(
         NSPanel::alloc(mtm),
@@ -327,7 +537,7 @@ pub fn edit_connection(
         labels.push(caption);
         fields.push(field);
     }
-    let mode_label = label("Forward To", 13., mtm);
+    let mode_label = label("Session Type", 13., mtm);
     let mode = NSPopUpButton::new(mtm);
     for title in ["Remote Host", "SSM Instance", "Custom Document"] {
         mode.addItemWithTitle(&NSString::from_str(title));
@@ -337,16 +547,19 @@ pub fn edit_connection(
         INSTANCE_DOCUMENT => 1,
         _ => 2,
     });
-    mode.setAccessibilityLabel(Some(&NSString::from_str("Forward To")));
+    mode.setAccessibilityLabel(Some(&NSString::from_str("Session Type")));
     document.addSubview(&mode_label);
     document.addSubview(&mode);
     let advanced = NSButton::new(mtm);
-    advanced.setButtonType(NSButtonType::Switch);
-    advanced.setTitle(&NSString::from_str("Advanced Settings"));
+    advanced.setButtonType(NSButtonType::PushOnPushOff);
+    advanced.setBezelStyle(NSBezelStyle::Disclosure);
+    advanced.setTitle(&NSString::from_str(""));
     advanced.setState(isize::from(
         !parameter_text.is_empty() || mode.indexOfSelectedItem() == 2,
     ));
     document.addSubview(&advanced);
+    let advanced_label = label("Advanced Settings", 13., mtm);
+    document.addSubview(&advanced_label);
     let parameters_label = label("Additional Parameters · One key=value per line", 12., mtm);
     document.addSubview(&parameters_label);
     let parameters_scroll = NSScrollView::new(mtm);
@@ -369,6 +582,10 @@ pub fn edit_connection(
     error.setTextColor(Some(&NSColor::labelColor()));
     error.setAccessibilityLabel(Some(&NSString::from_str("Validation Error")));
     content.addSubview(&error);
+    let field_error = NSTextField::wrappingLabelWithString(&NSString::from_str(""), mtm);
+    field_error.setFont(Some(&NSFont::systemFontOfSize(12.)));
+    field_error.setTextColor(Some(&NSColor::labelColor()));
+    document.addSubview(&field_error);
     let cancel = NSButton::new(mtm);
     cancel.setTitle(&NSString::from_str("Cancel"));
     cancel.setBezelStyle(NSBezelStyle::Push);
@@ -386,13 +603,23 @@ pub fn edit_connection(
         fields,
         labels,
         mode_label,
+        previous_mode: Cell::new(mode.indexOfSelectedItem()),
+        custom_document: RefCell::new(if mode.indexOfSelectedItem() == 2 {
+            values[4].clone()
+        } else {
+            String::new()
+        }),
         mode,
         advanced,
+        advanced_label,
         parameters_label,
         parameters_scroll,
         parameters,
         route,
         error,
+        field_error,
+        validation_target: Cell::new(None),
+        persistence_error: RefCell::new(String::new()),
         cancel,
         save,
         config: config.clone(),
@@ -417,25 +644,6 @@ pub fn edit_connection(
         state
             .parameters
             .setDelegate(Some(ProtocolObject::from_ref(&*editor)));
-        let order: [&NSView; 13] = [
-            &state.fields[0],
-            &state.mode,
-            &state.fields[5],
-            &state.fields[6],
-            &state.fields[7],
-            &state.fields[1],
-            &state.fields[2],
-            &state.fields[3],
-            &state.advanced,
-            &state.fields[4],
-            &state.parameters,
-            &state.cancel,
-            &state.save,
-        ];
-        for pair in order.windows(2) {
-            pair[0].setNextKeyView(Some(pair[1]));
-        }
-        state.save.setNextKeyView(Some(&state.fields[0]));
     }
     panel.setDelegate(Some(ProtocolObject::from_ref(&*editor)));
     panel.setInitialFirstResponder(Some(&state.fields[0]));
@@ -445,12 +653,38 @@ pub fn edit_connection(
     panel.makeKeyAndOrderFront(None);
     let app = NSApplication::sharedApplication(mtm);
     app.activate();
-    app.runModalForWindow(&panel);
+    let saved = loop {
+        let session = app.beginModalSessionForWindow(&panel);
+        // Pump a native modal session so background connection state keeps refreshing.
+        unsafe {
+            while app.runModalSession(session) == NSModalResponseContinue {
+                on_tick();
+                app.nextEventMatchingMask_untilDate_inMode_dequeue(
+                    NSEventMask::Any,
+                    Some(&NSDate::dateWithTimeIntervalSinceNow(0.1)),
+                    NSModalPanelRunLoopMode,
+                    false,
+                );
+            }
+            app.endModalSession(session);
+        }
+        let Some(connection) = state.result.borrow_mut().take() else {
+            break false;
+        };
+        match on_save(connection) {
+            Ok(()) => break true,
+            Err(error) => {
+                let message = format!("Could not save. Your changes are still here. {error:#}");
+                state.persistence_error.replace(message.clone());
+                editor.display_validation(None, false);
+                editor.announce_error(&message);
+            }
+        }
+    };
     panel.setDelegate(None);
     panel.orderOut(None);
     panel.close();
-    let result = editor.ivars().result.borrow_mut().take();
-    Ok(result)
+    Ok(saved)
 }
 
 fn rect(x: f64, y: f64, width: f64, height: f64) -> NSRect {
@@ -515,19 +749,28 @@ fn connection_from_fields(
     let document = fields[4].trim();
     let standard = matches!(document, INSTANCE_DOCUMENT | REMOTE_DOCUMENT);
     if fields[0].trim().is_empty() {
-        anyhow::bail!("Enter a session name.");
+        return Err(field_error(InputTarget::Field(0), "Enter a session name."));
     }
     if fields[1].trim().is_empty() {
-        anyhow::bail!("Enter the SSM target instance or managed node.");
+        return Err(field_error(
+            InputTarget::Field(1),
+            "Enter the SSM target instance or managed node.",
+        ));
     }
     if standard {
         for (index, name) in [(6, "remote"), (7, "local")] {
             if !matches!(fields[index].trim().parse::<u16>(), Ok(1..=65535)) {
-                anyhow::bail!("Enter a {name} port between 1 and 65535.");
+                return Err(field_error(
+                    InputTarget::Field(index),
+                    format!("Enter a {name} port between 1 and 65535."),
+                ));
             }
         }
         if document == REMOTE_DOCUMENT && fields[5].trim().is_empty() {
-            anyhow::bail!("Enter the remote host, or choose SSM Instance.");
+            return Err(field_error(
+                InputTarget::Field(5),
+                "Enter the remote host, or choose SSM Instance.",
+            ));
         }
     }
     let mut parameters = config::parse_parameters(
@@ -537,14 +780,18 @@ fn connection_from_fields(
             .filter(|line| !line.is_empty())
             .map(str::to_owned)
             .collect::<Vec<_>>(),
-    )?;
+    )
+    .map_err(|error| field_error(InputTarget::Parameters, error.to_string()))?;
     for (key, index) in [("host", 5), ("portNumber", 6), ("localPortNumber", 7)] {
         if key == "host" && document == INSTANCE_DOCUMENT {
             continue;
         }
         if let Some(value) = optional(index) {
             if parameters.insert(key.into(), value).is_some() {
-                anyhow::bail!("Set {key} in its labeled field, not Additional Parameters.");
+                return Err(field_error(
+                    InputTarget::Parameters,
+                    format!("Set {key} in its labeled field, not Additional Parameters."),
+                ));
             }
         }
     }
@@ -560,7 +807,10 @@ fn connection_from_fields(
             .unwrap_or_default(),
     };
     if crate::ssm::is_interactive(&connection) {
-        anyhow::bail!("Choose a forwarding document. Interactive shells require a terminal.");
+        return Err(field_error(
+            InputTarget::Field(4),
+            "Choose a forwarding document. Interactive shells require a terminal.",
+        ));
     }
     let mut candidate = config.clone();
     if let Some(existing) = existing {
@@ -569,7 +819,9 @@ fn connection_from_fields(
             .retain(|item| item.name != existing.name);
     }
     candidate.connections.push(connection.clone());
-    candidate.validate()?;
+    candidate
+        .validate()
+        .map_err(|error| field_error(InputTarget::Field(0), error.to_string()))?;
     Ok(connection)
 }
 
@@ -661,6 +913,43 @@ mod tests {
         instance[4] = INSTANCE_DOCUMENT.into();
         let connection = connection_from_fields(&Config::default(), None, &instance, "").unwrap();
         assert!(!connection.parameters.contains_key("host"));
+    }
+
+    #[test]
+    fn validation_identifies_the_field_to_focus_without_parsing_error_text() {
+        for index in [0, 1, 5, 6, 7] {
+            let mut fields = remote();
+            fields[index] = String::new();
+            let error = connection_from_fields(&Config::default(), None, &fields, "").unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<FieldError>().unwrap().target,
+                InputTarget::Field(index)
+            );
+        }
+        for parameters in ["invalid", "portNumber=22", "host=other.example.test"] {
+            let error = connection_from_fields(&Config::default(), None, &remote(), parameters)
+                .unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<FieldError>().unwrap().target,
+                InputTarget::Parameters
+            );
+        }
+        let connection = connection_from_fields(&Config::default(), None, &remote(), "").unwrap();
+        let config = Config {
+            connections: vec![connection],
+        };
+        let error = connection_from_fields(&config, None, &remote(), "").unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<FieldError>().unwrap().target,
+            InputTarget::Field(0)
+        );
+        let mut fields = remote();
+        fields[4] = String::new();
+        let error = connection_from_fields(&Config::default(), None, &fields, "").unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<FieldError>().unwrap().target,
+            InputTarget::Field(4)
+        );
     }
 
     #[test]

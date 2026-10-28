@@ -6,7 +6,8 @@ use objc2::{
 };
 use objc2_app_kit::{
     NSAccessibility, NSBezelStyle, NSButton, NSCellImagePosition, NSColor, NSFont, NSImage,
-    NSImageSymbolConfiguration, NSMenu, NSPopUpButton, NSTextField, NSView, NSWorkspace,
+    NSImageSymbolConfiguration, NSLineBreakMode, NSMenu, NSPopUpButton, NSTextField, NSView,
+    NSWorkspace,
 };
 use objc2_foundation::{
     NSArray, NSNumber, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
@@ -17,9 +18,12 @@ use tray_icon::menu::{ContextMenu, MenuEvent, MenuId, Submenu};
 #[link(name = "QuartzCore", kind = "framework")]
 extern "C" {}
 
+pub const ROW_HEIGHT: f64 = 80.;
+
 pub struct RowState {
     view: Retained<NSView>,
     button: Retained<NSButton>,
+    status: Retained<NSTextField>,
     action: MenuId,
     proxy: EventLoopProxy<MenuEvent>,
     name: String,
@@ -49,28 +53,37 @@ impl ConnectionRow {
         proxy: EventLoopProxy<MenuEvent>,
     ) -> Result<Retained<Self>> {
         let mtm = MainThreadMarker::new().context("menu rows require the main thread")?;
-        let view = NSView::initWithFrame(NSView::alloc(mtm), rect(0., 0., 420., 60.));
-        let name = label(&connection.name, rect(56., 31., 252., 20.), mtm);
+        let view = NSView::initWithFrame(NSView::alloc(mtm), rect(0., 0., 420., ROW_HEIGHT));
+        let name = label(&connection.name, rect(56., 54., 252., 20.), mtm);
         name.setFont(Some(&NSFont::boldSystemFontOfSize(13.)));
         name.setToolTip(Some(&NSString::from_str(&connection.name)));
         view.addSubview(&name);
         let route = label(
             &crate::menubar::connection_route(connection),
-            rect(56., 9., 252., 20.),
+            rect(56., 32., 252., 20.),
             mtm,
         );
         route.setTextColor(Some(&NSColor::secondaryLabelColor()));
+        route.setFont(NSFont::userFixedPitchFontOfSize(12.).as_deref());
+        if let Some(cell) = route.cell() {
+            cell.setLineBreakMode(NSLineBreakMode::ByTruncatingMiddle);
+        }
         view.addSubview(&route);
+        let status = label("", rect(56., 10., 352., 18.), mtm);
+        status.setFont(Some(&NSFont::systemFontOfSize(12.)));
+        view.addSubview(&status);
         let button = NSButton::new(mtm);
-        button.setFrame(rect(10., 12., 36., 36.));
-        button.setBordered(false);
+        button.setFrame(rect(10., 30., 36., 36.));
+        button.setBordered(true);
+        button.setBezelStyle(NSBezelStyle::Circular);
+        button.setShowsBorderOnlyWhileMouseInside(true);
         button.setTitle(&NSString::from_str(""));
         button.setImagePosition(NSCellImagePosition::ImageOnly);
         button.setWantsLayer(true);
         view.addSubview(&button);
         let more = NSPopUpButton::initWithFrame_pullsDown(
             NSPopUpButton::alloc(mtm),
-            rect(320., 16., 88., 28.),
+            rect(320., 38., 88., 28.),
             true,
         );
         more.setBezelStyle(NSBezelStyle::Push);
@@ -85,9 +98,13 @@ impl ConnectionRow {
             "Session details, edit, and delete",
         )));
         view.addSubview(&more);
+        unsafe {
+            button.setNextKeyView(Some(&more));
+        }
         let row = Self::alloc(mtm).set_ivars(RowState {
             view,
             button,
+            status,
             action,
             proxy,
             name: connection.name.clone(),
@@ -109,10 +126,22 @@ impl ConnectionRow {
     pub fn update(&self, state: ConnectionState, error: Option<&str>) {
         let row = self.ivars();
         let (symbol, action, status, color) = match state {
+            ConnectionState::Starting => (
+                "hourglass.circle.fill",
+                "Cancel Connection",
+                "Starting…",
+                NSColor::systemOrangeColor(),
+            ),
+            ConnectionState::Forwarding => (
+                "checkmark.circle.fill",
+                "Disconnect",
+                "Port Open",
+                NSColor::systemGreenColor(),
+            ),
             ConnectionState::Running => (
                 "arrow.left.arrow.right.circle.fill",
-                "Disconnect",
-                "Running",
+                "Stop Session",
+                "Process Running",
                 NSColor::systemGreenColor(),
             ),
             ConnectionState::Stopping => (
@@ -129,7 +158,7 @@ impl ConnectionRow {
             ),
             ConnectionState::Failed => (
                 "exclamationmark.circle.fill",
-                "Reconnect",
+                "Retry",
                 "Failed",
                 NSColor::systemRedColor(),
             ),
@@ -153,7 +182,7 @@ impl ConnectionRow {
             &NSImageSymbolConfiguration::configurationWithPointSize_weight(30., 0.0)
                 .configurationByApplyingConfiguration(&palette),
         ));
-        let animate = state == ConnectionState::Running
+        let animate = state == ConnectionState::Forwarding
             && row.view.window().is_some_and(|window| window.isVisible())
             && !NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion();
         // Core Animation keeps the pulse smooth without adding a UI polling timer.
@@ -179,6 +208,34 @@ impl ConnectionRow {
                 }
             }
         }
+        let status_text = if row.interactive {
+            "Choose a forwarding document in Edit Session".to_owned()
+        } else if state == ConnectionState::Failed {
+            match error {
+                Some(error) => format!("Failed — {}", crate::session::error_summary(error)),
+                None => "Failed — Retry or view details".to_owned(),
+            }
+        } else {
+            status.to_owned()
+        };
+        let status_detail = error.unwrap_or(match state {
+            ConnectionState::Starting => "Waiting for the local forwarding port. Click to cancel.",
+            ConnectionState::Forwarding => {
+                "Local forwarding port is open; remote service availability is not verified."
+            }
+            ConnectionState::Running => {
+                "Session process is running; forwarding readiness is unknown for this document."
+            }
+            _ => &status_text,
+        });
+        row.status.setStringValue(&NSString::from_str(&status_text));
+        row.status
+            .setToolTip(Some(&NSString::from_str(status_detail)));
+        row.status
+            .setAccessibilityLabel(Some(&NSString::from_str(&format!(
+                "{}: {status_text}. {status_detail}",
+                row.name
+            ))));
         row.button
             .setEnabled(!row.interactive && state != ConnectionState::Stopping);
         row.button
@@ -202,5 +259,11 @@ fn label(text: &str, frame: NSRect, mtm: MainThreadMarker) -> Retained<NSTextFie
     label.setFrame(frame);
     label.setFont(Some(&NSFont::systemFontOfSize(13.)));
     label.setTextColor(Some(&NSColor::labelColor()));
+    label.setMaximumNumberOfLines(1);
+    label.setToolTip(Some(&NSString::from_str(text)));
+    if let Some(cell) = label.cell() {
+        cell.setUsesSingleLineMode(true);
+        cell.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
+    }
     label
 }
