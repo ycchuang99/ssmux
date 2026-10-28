@@ -1,6 +1,6 @@
 [package]
 name = "ssmux"
-version = "0.6.0"
+version = "0.6.1"
 edition = "2021"
 description = "A macOS menu bar manager for AWS SSM sessions"
 license = "MIT"
